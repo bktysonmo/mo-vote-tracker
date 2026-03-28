@@ -1,3 +1,6 @@
+Here's the complete updated `app.py` with all the new features added — official similar bills, bill summaries, similar bill title matching, and the party rank drill-down:
+
+```python
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -18,9 +21,6 @@ st.title("🏛️ Missouri Vote Tracker")
 st.caption("Tracking votes in the Missouri House and Senate")
 
 # ----------------------- DATA LOADING -----------------------
-# Load everything into memory once when the app starts
-# st.cache_resource means "load this once and keep it for all users"
-# This is much faster than querying SQLite on every interaction
 
 @st.cache_resource
 def load_all_data():
@@ -43,27 +43,19 @@ def load_all_data():
         "SELECT roll_call_id, people_id, vote_text FROM member_votes",
         conn
     )
-
     try:
-        sponsors = pd.read_sql_query(
-            "SELECT bill_id, name, sponsor_type FROM sponsors", conn
-        )
+        sponsors = pd.read_sql_query("SELECT bill_id, name, sponsor_type FROM sponsors", conn)
     except Exception:
         sponsors = pd.DataFrame(columns=["bill_id", "name", "sponsor_type"])
-
     try:
-        committees = pd.read_sql_query(
-            "SELECT bill_id, committee_name, chamber FROM committees", conn
-        )
+        committees = pd.read_sql_query("SELECT bill_id, committee_name, chamber FROM committees", conn)
     except Exception:
         committees = pd.DataFrame(columns=["bill_id", "committee_name", "chamber"])
 
-    # Build a merged legislator+vote table once — used everywhere
     member_votes_full = member_votes.merge(
         legislators[["people_id", "name", "party", "chamber", "district"]],
         on="people_id", how="left"
     )
-
     conn.close()
     return legislators, bills, votes, member_votes, member_votes_full, sponsors, committees
 
@@ -71,22 +63,23 @@ legislators, bills, votes, member_votes, member_votes_full, sponsors, committees
 
 @st.cache_resource
 def get_history_db():
-    import sqlite3 as _sqlite3
     try:
-        conn = _sqlite3.connect("mo_history.db", check_same_thread=False)
-        conn.row_factory = _sqlite3.Row
+        conn = sqlite3.connect("mo_history.db", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
         return conn
-    except Exception as e:
+    except Exception:
         return None
+
+@st.cache_resource
+def get_current_db():
+    conn = sqlite3.connect("mo_votes.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 @st.cache_data
 def load_history_lookups():
-    # Only load the small lookup tables into memory
-    # Heavy data (member_votes) stays in SQLite and is queried on demand
     try:
-        import sqlite3 as _sqlite3
-        conn = _sqlite3.connect("mo_history.db", check_same_thread=False)
-
+        conn = sqlite3.connect("mo_history.db", check_same_thread=False)
         h_sessions = pd.read_sql_query(
             "SELECT session_id, session_name, year, special FROM sessions ORDER BY year DESC, special ASC",
             conn
@@ -98,10 +91,8 @@ def load_history_lookups():
             GROUP BY people_id
             ORDER BY name
         """, conn)
-
         h_sponsors = pd.read_sql_query(
-            "SELECT bill_id, session_id, name, sponsor_type, people_id FROM sponsors",
-            conn
+            "SELECT bill_id, session_id, name, sponsor_type, people_id FROM sponsors", conn
         )
         h_similar = pd.read_sql_query(
             "SELECT bill_id, similar_bill_id, similar_number, similar_title, similar_session FROM similar_bills",
@@ -112,6 +103,37 @@ def load_history_lookups():
     except Exception as e:
         st.error(f"Could not load historical database: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+h_sessions, h_legislators, h_sponsors, h_similar = load_history_lookups()
+
+# ----------------------- CURRENT DB QUERIES -----------------------
+
+def get_official_similar_bills(bill_id):
+    conn = get_current_db()
+    try:
+        df = pd.read_sql_query("""
+            SELECT similar_number, similar_year, relationship, source_version
+            FROM similar_bills
+            WHERE bill_id = ?
+            ORDER BY similar_year DESC
+        """, conn, params=(bill_id,))
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def get_bill_summary_text(bill_id):
+    conn = get_current_db()
+    try:
+        df = pd.read_sql_query("""
+            SELECT summary_text, source_version
+            FROM bill_summaries
+            WHERE bill_id = ?
+        """, conn, params=(bill_id,))
+        return df.iloc[0] if not df.empty else None
+    except Exception:
+        return None
+
+# ----------------------- HISTORY DB QUERIES -----------------------
 
 def search_history_bills(keyword, bill_num, year, session_type, status, session_options):
     hconn = get_history_db()
@@ -187,32 +209,23 @@ def get_history_topic_breakers(topic):
     hconn = get_history_db()
     if hconn is None:
         return pd.DataFrame(), pd.DataFrame()
-    # Find bills matching topic
     topic_bills = pd.read_sql_query("""
         SELECT bill_id, bill_number, title, session_name
         FROM bills WHERE title LIKE ?
         ORDER BY session_name DESC
     """, hconn, params=(f"%{topic}%",))
-
     if topic_bills.empty:
         return pd.DataFrame(), pd.DataFrame()
-
     bill_ids = topic_bills["bill_id"].tolist()
     placeholders = ",".join("?" * len(bill_ids))
-
-    # Get all roll calls for those bills
     roll_calls = pd.read_sql_query(f"""
         SELECT roll_call_id, bill_id, date, passed
         FROM votes WHERE bill_id IN ({placeholders})
     """, hconn, params=bill_ids)
-
     if roll_calls.empty:
         return topic_bills, pd.DataFrame()
-
     rc_ids = roll_calls["roll_call_id"].tolist()
     placeholders2 = ",".join("?" * len(rc_ids))
-
-    # Get all member votes on those roll calls with legislator info
     mv = pd.read_sql_query(f"""
         SELECT mv.roll_call_id, mv.people_id, mv.vote_text,
                l.name, l.party, MAX(l.currently_serving) as currently_serving
@@ -221,14 +234,10 @@ def get_history_topic_breakers(topic):
         WHERE mv.roll_call_id IN ({placeholders2})
         GROUP BY mv.roll_call_id, mv.people_id
     """, hconn, params=rc_ids)
-
     return topic_bills, mv.merge(roll_calls, on="roll_call_id", how="left") \
                           .merge(topic_bills[["bill_id", "bill_number", "title", "session_name"]], on="bill_id", how="left")
 
-h_sessions, h_legislators, h_sponsors, h_similar = load_history_lookups()
-
-# ----------------------- HELPER FUNCTIONS -----------------------
-# These all operate on in-memory dataframes — no database queries
+# ----------------------- IN-MEMORY HELPERS -----------------------
 
 def get_voting_record(people_id):
     mv = member_votes_full[member_votes_full["people_id"] == people_id].copy()
@@ -273,16 +282,57 @@ def search_bills(bill_number_query, title_query, chamber_filter,
     if session_filter and session_filter != "All":
         result = result[result["session"] == session_filter]
     if committee_filter and committee_filter != "All" and not committees.empty:
-        matching_bill_ids = committees[
-            committees["committee_name"] == committee_filter
-        ]["bill_id"].tolist()
-        result = result[result["bill_id"].isin(matching_bill_ids)]
+        matching = committees[committees["committee_name"] == committee_filter]["bill_id"].tolist()
+        result = result[result["bill_id"].isin(matching)]
     if sponsor_filter and sponsor_filter != "All" and not sponsors.empty:
-        matching_bill_ids = sponsors[
-            sponsors["name"] == sponsor_filter
-        ]["bill_id"].tolist()
-        result = result[result["bill_id"].isin(matching_bill_ids)]
+        matching = sponsors[sponsors["name"] == sponsor_filter]["bill_id"].tolist()
+        result = result[result["bill_id"].isin(matching)]
     return result.head(200)
+
+def find_similar_bills(bill_title, current_bill_id, current_session_name, limit=10):
+    hconn = get_history_db()
+    if hconn is None:
+        return pd.DataFrame()
+    filler = {
+        "the", "a", "an", "to", "of", "in", "for", "and", "or", "by",
+        "with", "relating", "regarding", "concerning", "provides", "provide",
+        "establishes", "establish", "modifies", "modify", "amends", "amend",
+        "creates", "create", "act", "law", "section", "sections", "chapter",
+        "this", "that", "which", "any", "all", "such", "other", "certain",
+        "provisions", "provision", "relative", "makes", "make", "from",
+        "requires", "require", "authorizes", "authorize", "allowing", "allow"
+    }
+    words = [
+        w.lower().strip(".,;:()")
+        for w in bill_title.split()
+        if w.lower().strip(".,;:()") not in filler
+        and len(w.strip(".,;:()")) > 3
+    ]
+    if not words:
+        return pd.DataFrame()
+    score_parts = " + ".join([
+        f"CASE WHEN LOWER(b.title) LIKE ? THEN 1 ELSE 0 END"
+        for _ in words
+    ])
+    params = [f"%{w}%" for w in words]
+    sql = f"""
+        SELECT b.bill_id, b.bill_number, b.title, b.session_name,
+               b.status, b.chamber, b.url,
+               ({score_parts}) as score
+        FROM bills b
+        WHERE b.bill_id != ?
+        AND b.session_name != ?
+        AND ({score_parts}) >= ?
+        ORDER BY score DESC, b.session_name DESC
+        LIMIT ?
+    """
+    min_score = max(2, len(words) // 3)
+    full_params = params + [current_bill_id, current_session_name] + params + [min_score, limit]
+    try:
+        result = pd.read_sql_query(sql, hconn, params=full_params)
+        return result[result["score"] > 0].copy()
+    except Exception:
+        return pd.DataFrame()
 
 def calculate_party_line(roll_call_df):
     results = []
@@ -315,7 +365,6 @@ def calculate_party_line(roll_call_df):
 def build_legislator_party_line_df(people_id, party, record_df):
     rows = []
     for _, vote_row in record_df.iterrows():
-        # Find the roll_call_id for this specific vote
         match = votes[
             (votes["bill_id"].isin(bills[bills["bill_number"] == vote_row["bill_number"]]["bill_id"])) &
             (votes["date"] == vote_row["date"]) &
@@ -349,6 +398,39 @@ def build_legislator_party_line_df(people_id, party, record_df):
         })
     return pd.DataFrame(rows)
 
+# ----------------------- SIMILAR BILL DETAIL HELPER -----------------------
+
+def render_similar_bill_detail(sim_bill_id, sim_bill_number, sim_title, sim_session, sim_url, key_prefix):
+    st.subheader(f"📄 {sim_bill_number} — {sim_title}")
+    st.caption(f"{sim_session}")
+    if sim_url:
+        st.caption(f"[View on LegiScan]({sim_url})")
+    sim_votes = get_history_bill_votes(sim_bill_id)
+    if sim_votes.empty:
+        st.info("No recorded roll call votes for this bill.")
+    else:
+        for _, rc in sim_votes.iterrows():
+            result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
+            with st.expander(f"{rc['date']} — {rc['description']} ({result_label})"):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Yea", rc["yea"])
+                c2.metric("Nay", rc["nay"])
+                c3.metric("NV/Absent", rc["nv"])
+                detail = get_history_roll_call_detail(int(rc["roll_call_id"]))
+                if not detail.empty:
+                    party_summary = calculate_party_line(detail)
+                    if not party_summary.empty:
+                        st.markdown("**Party Line Analysis**")
+                        st.dataframe(party_summary, use_container_width=True)
+                    st.markdown("**Individual Votes**")
+                    st.dataframe(
+                        detail[["name", "party", "chamber", "vote_text"]].rename(columns={
+                            "name": "Name", "party": "Party",
+                            "chamber": "Chamber", "vote_text": "Vote"
+                        }),
+                        use_container_width=True
+                    )
+
 # ----------------------- BILL DETAIL RENDERER -----------------------
 
 def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
@@ -372,6 +454,59 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
     cm = get_bill_committees(bill_id)
     if not cm.empty:
         st.markdown(f"**Committee:** {', '.join(cm['committee_name'].tolist())}")
+
+    # Official bill summary
+    summary_row = get_bill_summary_text(bill_id)
+    if summary_row is not None:
+        with st.expander("📝 Official Bill Summary"):
+            version = summary_row["source_version"]
+            source = "MO House PDF" if version in ["I", "S", "T", "C"] else "MO Senate website"
+            st.caption(f"Source: {source} (version {version})")
+            st.write(summary_row["summary_text"])
+
+    # Similar bills
+    with st.expander("📋 Similar Bills in Other Sessions"):
+        official = get_official_similar_bills(bill_id)
+        if not official.empty:
+            st.caption("Official references from MO House/Senate summaries")
+            for _, row in official.iterrows():
+                rel = row["relationship"].replace("is ", "").title()
+                st.markdown(f"- **{row['similar_number']}** ({row['similar_year']}) — {rel}")
+            st.divider()
+
+        with st.spinner("Searching historical sessions..."):
+            similar = find_similar_bills(
+                bill_title, bill_id,
+                bill_row.get("session", "") or "",
+                limit=10
+            )
+        if not similar.empty:
+            st.caption("Related bills found by title matching in historical database")
+            sim_display = similar[[
+                "bill_number", "title", "session_name", "status", "score"
+            ]].rename(columns={
+                "bill_number": "Bill", "title": "Title",
+                "session_name": "Session", "status": "Status", "score": "Relevance"
+            }).reset_index(drop=True)
+
+            sim_sel = st.dataframe(
+                sim_display, use_container_width=True,
+                on_select="rerun", selection_mode="single-row",
+                key=f"sim_{bill_id}"
+            )
+            if sim_sel.selection.rows:
+                sim_row = similar.iloc[sim_sel.selection.rows[0]]
+                st.divider()
+                render_similar_bill_detail(
+                    int(sim_row["bill_id"]),
+                    sim_row["bill_number"],
+                    sim_row["title"],
+                    sim_row["session_name"],
+                    sim_row["url"],
+                    key_prefix=f"cur_{bill_id}"
+                )
+        elif official.empty:
+            st.info("No similar bills found.")
 
     st.divider()
 
@@ -402,11 +537,9 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             c1.metric("Yea", rc["yea"])
             c2.metric("Nay", rc["nay"])
             c3.metric("NV/Absent", rc["nv"])
-
             if not rc["party_summary_df"].empty:
                 st.markdown("**Party Line Analysis**")
                 st.dataframe(rc["party_summary_df"], use_container_width=True)
-
             if not rc["detail_df"].empty:
                 st.markdown("**Individual Votes**")
                 st.dataframe(
@@ -464,6 +597,7 @@ if "last_search" not in st.session_state:
 # ----------------------- PAGE ROUTING -----------------------
 
 page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup", "Historical Search"])
+
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
 if page == "Legislator Lookup":
@@ -511,7 +645,6 @@ if page == "Legislator Lookup":
 
         st.subheader("Download Reports")
         c1, c2, c3 = st.columns(3)
-
         with c1:
             if st.button("Generate Voting Record PDF"):
                 with st.spinner("Generating PDF..."):
@@ -548,7 +681,8 @@ if page == "Legislator Lookup":
                     mime="application/pdf"
                 )
 
-# ----------------------- BILL LOOKUP ----------------------
+# ----------------------- BILL LOOKUP -----------------------
+
 elif page == "Bill Lookup":
     st.header("Bill Search")
 
@@ -580,23 +714,15 @@ elif page == "Bill Lookup":
         st.info("No bills match your search. Try adjusting your filters.")
     else:
         display_results = results[["bill_number", "title", "chamber", "status", "session"]].rename(columns={
-            "bill_number": "Bill",
-            "title": "Title",
-            "chamber": "Chamber",
-            "status": "Status",
-            "session": "Session"
+            "bill_number": "Bill", "title": "Title",
+            "chamber": "Chamber", "status": "Status", "session": "Session"
         }).reset_index(drop=True)
 
-        # on_select="rerun" makes clicking a row immediately trigger the detail view
-        # selection_mode="single-row" means only one row can be selected at a time
         selected = st.dataframe(
-            display_results,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row"
+            display_results, use_container_width=True,
+            on_select="rerun", selection_mode="single-row"
         )
 
-        # selected.selection.rows is a list of selected row indices
         if selected.selection.rows:
             row_index = selected.selection.rows[0]
             selected_bill = results.iloc[row_index]
@@ -608,6 +734,7 @@ elif page == "Bill Lookup":
                 selected_bill["title"],
                 selected_bill
             )
+
 # ----------------------- HISTORICAL SEARCH -----------------------
 
 elif page == "Historical Search":
@@ -651,13 +778,13 @@ elif page == "Historical Search":
                 "session_name": "Session", "status": "Status", "chamber": "Chamber"
             }).reset_index(drop=True)
 
-            selected = st.dataframe(
+            h_selected = st.dataframe(
                 display, use_container_width=True,
                 on_select="rerun", selection_mode="single-row"
             )
 
-            if selected.selection.rows:
-                row_index = selected.selection.rows[0]
+            if h_selected.selection.rows:
+                row_index = h_selected.selection.rows[0]
                 sel_bill = h_results.iloc[row_index]
                 bill_id = int(sel_bill["bill_id"])
 
@@ -677,11 +804,38 @@ elif page == "Historical Search":
                     if cospon:
                         st.markdown(f"**Co-Sponsors:** {', '.join(cospon)}")
 
-                similar = h_similar[h_similar["bill_id"] == bill_id]
-                if not similar.empty:
-                    st.markdown("**Similar Bills in Other Sessions:**")
-                    for _, sb in similar.iterrows():
-                        st.markdown(f"- {sb['similar_number']} ({sb['similar_session']}) — {sb['similar_title']}")
+                # Similar bills via title matching
+                with st.expander("📋 Similar Bills in Other Sessions"):
+                    with st.spinner("Searching..."):
+                        h_similar_results = find_similar_bills(
+                            sel_bill["title"], bill_id, sel_bill["session_name"], limit=10
+                        )
+                    if h_similar_results.empty:
+                        st.info("No similar bills found in other sessions.")
+                    else:
+                        sim_display = h_similar_results[[
+                            "bill_number", "title", "session_name", "status", "score"
+                        ]].rename(columns={
+                            "bill_number": "Bill", "title": "Title",
+                            "session_name": "Session", "status": "Status", "score": "Relevance"
+                        }).reset_index(drop=True)
+
+                        h_sim_sel = st.dataframe(
+                            sim_display, use_container_width=True,
+                            on_select="rerun", selection_mode="single-row",
+                            key=f"hsim_{bill_id}"
+                        )
+                        if h_sim_sel.selection.rows:
+                            sim_row = h_similar_results.iloc[h_sim_sel.selection.rows[0]]
+                            st.divider()
+                            render_similar_bill_detail(
+                                int(sim_row["bill_id"]),
+                                sim_row["bill_number"],
+                                sim_row["title"],
+                                sim_row["session_name"],
+                                sim_row["url"],
+                                key_prefix=f"hist_{bill_id}"
+                            )
 
                 bill_votes = get_history_bill_votes(bill_id)
                 if bill_votes.empty:
@@ -694,7 +848,6 @@ elif page == "Historical Search":
                             c1.metric("Yea", rc["yea"])
                             c2.metric("Nay", rc["nay"])
                             c3.metric("NV/Absent", rc["nv"])
-
                             detail = get_history_roll_call_detail(int(rc["roll_call_id"]))
                             if not detail.empty:
                                 party_summary = calculate_party_line(detail)
@@ -905,19 +1058,56 @@ elif page == "Historical Search":
                         st.info("No party rank breaks found for this topic.")
                     else:
                         breaker_df = pd.DataFrame(breaker_rows)
-                        st.markdown(f"#### Party Rank Breakers on '{topic}' Bills")
-                        st.caption(f"{len(breaker_df)} instances across {mv_data['roll_call_id'].nunique()} roll calls")
 
+                        # Summary table with All row at top
                         repeat_breakers = breaker_df.groupby(
                             ["Legislator", "Party", "Status"]
                         ).size().reset_index(name="Times Broke Rank") \
                          .sort_values("Times Broke Rank", ascending=False)
 
-                        st.markdown("**Repeat Rank Breakers (sorted by frequency)**")
-                        st.dataframe(repeat_breakers, use_container_width=True)
+                        all_row = pd.DataFrame([{
+                            "Legislator": "⬛ All Legislators",
+                            "Party": "",
+                            "Status": "",
+                            "Times Broke Rank": len(breaker_df)
+                        }])
+                        summary_table = pd.concat([all_row, repeat_breakers], ignore_index=True)
 
-                        st.markdown("**All Individual Instances**")
-                        st.dataframe(
-                            breaker_df.sort_values(["Legislator", "Session"]),
-                            use_container_width=True
+                        st.markdown(f"#### Party Rank Breakers on '{topic}' Bills")
+                        st.caption(f"Click a row to see that legislator's specific breaking votes below")
+
+                        sel = st.dataframe(
+                            summary_table, use_container_width=True,
+                            on_select="rerun", selection_mode="single-row",
+                            key="breaker_summary"
                         )
+
+                        selected_idx = sel.selection.rows[0] if sel.selection.rows else 0
+
+                        st.divider()
+
+                        if selected_idx == 0:
+                            st.markdown("**All Rank-Breaking Votes**")
+                            st.dataframe(
+                                breaker_df[[
+                                    "Legislator", "Party", "Status", "Session",
+                                    "Bill", "Title", "Party Line", "Their Vote", "Party Unity %"
+                                ]].sort_values(["Legislator", "Session"]),
+                                use_container_width=True
+                            )
+                        else:
+                            sel_name = summary_table.iloc[selected_idx]["Legislator"]
+                            sel_party = summary_table.iloc[selected_idx]["Party"]
+                            sel_status = summary_table.iloc[selected_idx]["Status"]
+                            leg_breaks = breaker_df[breaker_df["Legislator"] == sel_name]
+
+                            st.markdown(f"**{sel_name}** ({sel_party}) — {sel_status}")
+                            st.caption(f"Broke party rank {len(leg_breaks)} time(s) on '{topic}' bills")
+
+                            st.dataframe(
+                                leg_breaks[[
+                                    "Session", "Bill", "Title",
+                                    "Party Line", "Their Vote", "Party Unity %"
+                                ]].sort_values("Session"),
+                                use_container_width=True
+                            )
