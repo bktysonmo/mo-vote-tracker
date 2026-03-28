@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from database import get_connection
+import sqlite3
 from pdf_reports import (
     generate_legislator_voting_record,
     generate_legislator_party_line_report,
@@ -17,262 +17,166 @@ st.set_page_config(
 st.title("🏛️ Missouri Vote Tracker")
 st.caption("Tracking votes in the Missouri House and Senate")
 
-# ----------------------- DATABASE QUERIES -----------------------
+# ----------------------- DATA LOADING -----------------------
+# Load everything into memory once when the app starts
+# st.cache_resource means "load this once and keep it for all users"
+# This is much faster than querying SQLite on every interaction
 
-@st.cache_data
-def get_legislators():
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT people_id, name, party, chamber, district
-        FROM legislators
-        ORDER BY chamber, name
-    """, conn)
+@st.cache_resource
+def load_all_data():
+    conn = sqlite3.connect("mo_votes.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
+    legislators = pd.read_sql_query(
+        "SELECT people_id, name, party, chamber, district FROM legislators ORDER BY chamber, name",
+        conn
+    )
+    bills = pd.read_sql_query(
+        "SELECT bill_id, bill_number, title, session, status, chamber, url FROM bills ORDER BY bill_number",
+        conn
+    )
+    votes = pd.read_sql_query(
+        "SELECT roll_call_id, bill_id, date, description, chamber, yea, nay, nv, passed FROM votes",
+        conn
+    )
+    member_votes = pd.read_sql_query(
+        "SELECT roll_call_id, people_id, vote_text FROM member_votes",
+        conn
+    )
+
+    try:
+        sponsors = pd.read_sql_query(
+            "SELECT bill_id, name, sponsor_type FROM sponsors", conn
+        )
+    except Exception:
+        sponsors = pd.DataFrame(columns=["bill_id", "name", "sponsor_type"])
+
+    try:
+        committees = pd.read_sql_query(
+            "SELECT bill_id, committee_name, chamber FROM committees", conn
+        )
+    except Exception:
+        committees = pd.DataFrame(columns=["bill_id", "committee_name", "chamber"])
+
+    # Build a merged legislator+vote table once — used everywhere
+    member_votes_full = member_votes.merge(
+        legislators[["people_id", "name", "party", "chamber", "district"]],
+        on="people_id", how="left"
+    )
+
     conn.close()
-    return df
+    return legislators, bills, votes, member_votes, member_votes_full, sponsors, committees
 
-@st.cache_data
+legislators, bills, votes, member_votes, member_votes_full, sponsors, committees = load_all_data()
+
+# ----------------------- HELPER FUNCTIONS -----------------------
+# These all operate on in-memory dataframes — no database queries
+
 def get_voting_record(people_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT
-            b.bill_number,
-            b.title,
-            v.date,
-            v.description,
-            v.chamber,
-            v.passed,
-            mv.vote_text,
-            b.url
-        FROM member_votes mv
-        JOIN votes v ON mv.roll_call_id = v.roll_call_id
-        JOIN bills b ON v.bill_id = b.bill_id
-        WHERE mv.people_id = ?
-        ORDER BY v.date DESC
-    """, conn, params=(people_id,))
-    conn.close()
-    return df
+    mv = member_votes_full[member_votes_full["people_id"] == people_id].copy()
+    merged = mv.merge(votes, on="roll_call_id", how="left")
+    merged = merged.merge(bills[["bill_id", "bill_number", "title", "url"]], on="bill_id", how="left")
+    merged = merged.sort_values("date", ascending=False)
+    return merged[["bill_number", "title", "date", "description", "passed", "vote_text", "url"]]
 
-@st.cache_data
 def get_vote_summary(people_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT vote_text, COUNT(*) as count
-        FROM member_votes
-        WHERE people_id = ?
-        GROUP BY vote_text
-        ORDER BY count DESC
-    """, conn, params=(people_id,))
-    conn.close()
-    return df
+    mv = member_votes[member_votes["people_id"] == people_id]
+    summary = mv.groupby("vote_text").size().reset_index(name="count")
+    return summary.sort_values("count", ascending=False)
 
-@st.cache_data
-def get_bill_votes(bill_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT
-            v.roll_call_id,
-            v.date,
-            v.description,
-            v.chamber,
-            v.yea,
-            v.nay,
-            v.nv,
-            v.passed
-        FROM votes v
-        WHERE v.bill_id = ?
-        ORDER BY v.date DESC
-    """, conn, params=(bill_id,))
-    conn.close()
-    return df
-
-@st.cache_data
 def get_roll_call_detail(roll_call_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT
-            l.name,
-            l.party,
-            l.chamber,
-            l.district,
-            mv.vote_text
-        FROM member_votes mv
-        JOIN legislators l ON mv.people_id = l.people_id
-        WHERE mv.roll_call_id = ?
-        ORDER BY l.party, l.name
-    """, conn, params=(roll_call_id,))
-    conn.close()
-    return df
+    mv = member_votes_full[member_votes_full["roll_call_id"] == roll_call_id].copy()
+    return mv[["name", "party", "chamber", "district", "vote_text"]].sort_values(["party", "name"])
 
-@st.cache_data
-def get_bill_search_filters():
-    conn = get_connection()
-    sessions = pd.read_sql_query(
-        "SELECT DISTINCT session FROM bills WHERE session != '' ORDER BY session DESC", conn
-    )
-    statuses = pd.read_sql_query(
-        "SELECT DISTINCT status FROM bills WHERE status != '' ORDER BY status", conn
-    )
-    committees = pd.read_sql_query(
-        "SELECT DISTINCT committee_name FROM committees WHERE committee_name != '' ORDER BY committee_name", conn
-    )
-    sponsors = pd.read_sql_query(
-        "SELECT DISTINCT name FROM sponsors WHERE name != '' ORDER BY name", conn
-    )
-    conn.close()
-    return (
-        sessions["session"].tolist(),
-        statuses["status"].tolist(),
-        committees["committee_name"].tolist(),
-        sponsors["name"].tolist(),
-    )
+def get_bill_votes(bill_id):
+    return votes[votes["bill_id"] == bill_id].sort_values("date", ascending=False)
 
-@st.cache_data
+def get_bill_sponsors(bill_id):
+    if sponsors.empty:
+        return pd.DataFrame()
+    return sponsors[sponsors["bill_id"] == bill_id]
+
+def get_bill_committees(bill_id):
+    if committees.empty:
+        return pd.DataFrame()
+    return committees[committees["bill_id"] == bill_id]
+
 def search_bills(bill_number_query, title_query, chamber_filter,
                  status_filter, session_filter, committee_filter, sponsor_filter):
-    conn = get_connection()
-    sql = """
-        SELECT DISTINCT
-            b.bill_id,
-            b.bill_number,
-            b.title,
-            b.session,
-            b.status,
-            b.chamber,
-            b.url
-        FROM bills b
-        LEFT JOIN committees c ON b.bill_id = c.bill_id
-        LEFT JOIN sponsors s ON b.bill_id = s.bill_id
-        WHERE 1=1
-    """
-    params = []
+    result = bills.copy()
     if bill_number_query:
-        sql += " AND b.bill_number LIKE ?"
-        params.append(f"%{bill_number_query}%")
+        result = result[result["bill_number"].str.contains(bill_number_query, case=False, na=False)]
     if title_query:
-        sql += " AND b.title LIKE ?"
-        params.append(f"%{title_query}%")
+        result = result[result["title"].str.contains(title_query, case=False, na=False)]
     if chamber_filter and chamber_filter != "All":
-        sql += " AND b.chamber = ?"
-        params.append(chamber_filter)
+        result = result[result["chamber"] == chamber_filter]
     if status_filter and status_filter != "All":
-        sql += " AND b.status = ?"
-        params.append(status_filter)
+        result = result[result["status"] == status_filter]
     if session_filter and session_filter != "All":
-        sql += " AND b.session = ?"
-        params.append(session_filter)
-    if committee_filter and committee_filter != "All":
-        sql += " AND c.committee_name = ?"
-        params.append(committee_filter)
-    if sponsor_filter and sponsor_filter != "All":
-        sql += " AND s.name = ?"
-        params.append(sponsor_filter)
-    sql += " ORDER BY b.bill_number"
-    df = pd.read_sql_query(sql, conn, params=params if params else None)
-    conn.close()
-    return df
-
-@st.cache_data
-def get_bill_sponsors(bill_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT name, sponsor_type
-        FROM sponsors
-        WHERE bill_id = ?
-        ORDER BY sponsor_type, name
-    """, conn, params=(bill_id,))
-    conn.close()
-    return df
-
-@st.cache_data
-def get_bill_committees(bill_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT committee_name, chamber
-        FROM committees
-        WHERE bill_id = ?
-    """, conn, params=(bill_id,))
-    conn.close()
-    return df
-
-@st.cache_data
-def get_bill_by_id(bill_id):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT bill_id, bill_number, title, session, status, chamber, url
-        FROM bills WHERE bill_id = ?
-    """, conn, params=(bill_id,))
-    conn.close()
-    return df.iloc[0] if not df.empty else None
-
-# ----------------------- PARTY LINE CALCULATION -----------------------
+        result = result[result["session"] == session_filter]
+    if committee_filter and committee_filter != "All" and not committees.empty:
+        matching_bill_ids = committees[
+            committees["committee_name"] == committee_filter
+        ]["bill_id"].tolist()
+        result = result[result["bill_id"].isin(matching_bill_ids)]
+    if sponsor_filter and sponsor_filter != "All" and not sponsors.empty:
+        matching_bill_ids = sponsors[
+            sponsors["name"] == sponsor_filter
+        ]["bill_id"].tolist()
+        result = result[result["bill_id"].isin(matching_bill_ids)]
+    return result.head(200)
 
 def calculate_party_line(roll_call_df):
     results = []
-    parties = roll_call_df["party"].unique()
-    for party in sorted(parties):
+    for party in sorted(roll_call_df["party"].dropna().unique()):
         if party == "":
             continue
-        party_votes = roll_call_df[roll_call_df["party"] == party]
-        total = len(party_votes)
-        yea_count = len(party_votes[party_votes["vote_text"] == "Yea"])
-        nay_count = len(party_votes[party_votes["vote_text"] == "Nay"])
-        nv_count = len(party_votes[party_votes["vote_text"].isin(["NV", "Absent"])])
-        if yea_count >= nay_count:
-            party_line = "Yea"
-            unity = round((yea_count / total) * 100, 1) if total > 0 else 0
-        else:
-            party_line = "Nay"
-            unity = round((nay_count / total) * 100, 1) if total > 0 else 0
-        broke_rank = party_votes[
-            (party_votes["vote_text"].isin(["Yea", "Nay"])) &
-            (party_votes["vote_text"] != party_line)
+        pv = roll_call_df[roll_call_df["party"] == party]
+        total = len(pv)
+        yea = len(pv[pv["vote_text"] == "Yea"])
+        nay = len(pv[pv["vote_text"] == "Nay"])
+        nv = len(pv[pv["vote_text"].isin(["NV", "Absent"])])
+        party_line = "Yea" if yea >= nay else "Nay"
+        unity = round((max(yea, nay) / total) * 100, 1) if total > 0 else 0
+        broke = pv[
+            (pv["vote_text"].isin(["Yea", "Nay"])) &
+            (pv["vote_text"] != party_line)
         ]["name"].tolist()
         results.append({
             "Party": party,
             "Total Members": total,
-            "Yea": yea_count,
-            "Nay": nay_count,
-            "NV/Absent": nv_count,
+            "Yea": yea,
+            "Nay": nay,
+            "NV/Absent": nv,
             "Party Line": party_line,
             "Unity %": unity,
-            "Broke Rank": ", ".join(broke_rank) if broke_rank else "None"
+            "Broke Rank": ", ".join(broke) if broke else "None"
         })
     return pd.DataFrame(results)
 
 def build_legislator_party_line_df(people_id, party, record_df):
-    conn = get_connection()
     rows = []
     for _, vote_row in record_df.iterrows():
-        rc = pd.read_sql_query("""
-            SELECT mv.roll_call_id
-            FROM member_votes mv
-            JOIN votes v ON mv.roll_call_id = v.roll_call_id
-            JOIN bills b ON v.bill_id = b.bill_id
-            WHERE mv.people_id = ?
-            AND b.bill_number = ?
-            AND v.date = ?
-            AND v.description = ?
-            LIMIT 1
-        """, conn, params=(
-            people_id,
-            vote_row["bill_number"],
-            vote_row["date"],
-            vote_row["description"]
-        ))
-        if rc.empty:
+        # Find the roll_call_id for this specific vote
+        match = votes[
+            (votes["bill_id"].isin(bills[bills["bill_number"] == vote_row["bill_number"]]["bill_id"])) &
+            (votes["date"] == vote_row["date"]) &
+            (votes["description"] == vote_row["description"])
+        ]
+        if match.empty:
             continue
-        roll_call_id = int(rc.iloc[0]["roll_call_id"])
+        roll_call_id = int(match.iloc[0]["roll_call_id"])
         detail = get_roll_call_detail(roll_call_id)
         if detail.empty:
             continue
-        party_votes = detail[detail["party"] == party]
-        if party_votes.empty:
+        pv = detail[detail["party"] == party]
+        if pv.empty:
             continue
-        yea_count = len(party_votes[party_votes["vote_text"] == "Yea"])
-        nay_count = len(party_votes[party_votes["vote_text"] == "Nay"])
-        total = len(party_votes)
-        party_line = "Yea" if yea_count >= nay_count else "Nay"
-        unity = round((max(yea_count, nay_count) / total) * 100, 1) if total > 0 else 0
+        yea = len(pv[pv["vote_text"] == "Yea"])
+        nay = len(pv[pv["vote_text"] == "Nay"])
+        total = len(pv)
+        party_line = "Yea" if yea >= nay else "Nay"
+        unity = round((max(yea, nay) / total) * 100, 1) if total > 0 else 0
         member_vote = vote_row["vote_text"]
         broke_rank = member_vote in ["Yea", "Nay"] and member_vote != party_line
         rows.append({
@@ -285,7 +189,6 @@ def build_legislator_party_line_df(people_id, party, record_df):
             "broke_rank": broke_rank,
             "unity_pct": unity
         })
-    conn.close()
     return pd.DataFrame(rows)
 
 # ----------------------- BILL DETAIL RENDERER -----------------------
@@ -299,18 +202,18 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
     if bill_row["url"]:
         st.caption(f"[View on LegiScan]({bill_row['url']})")
 
-    sponsors_df = get_bill_sponsors(bill_id)
-    if not sponsors_df.empty:
-        primary = sponsors_df[sponsors_df["sponsor_type"] == "Primary"]["name"].tolist()
-        cospon = sponsors_df[sponsors_df["sponsor_type"] == "Co-Sponsor"]["name"].tolist()
+    sp = get_bill_sponsors(bill_id)
+    if not sp.empty:
+        primary = sp[sp["sponsor_type"] == "Primary"]["name"].tolist()
+        cospon = sp[sp["sponsor_type"] == "Co-Sponsor"]["name"].tolist()
         if primary:
             st.markdown(f"**Primary Sponsor:** {', '.join(primary)}")
         if cospon:
             st.markdown(f"**Co-Sponsors:** {', '.join(cospon)}")
 
-    committees_df = get_bill_committees(bill_id)
-    if not committees_df.empty:
-        st.markdown(f"**Committee:** {', '.join(committees_df['committee_name'].tolist())}")
+    cm = get_bill_committees(bill_id)
+    if not cm.empty:
+        st.markdown(f"**Committee:** {', '.join(cm['committee_name'].tolist())}")
 
     st.divider()
 
@@ -319,37 +222,10 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
         st.info("No roll call votes recorded for this bill yet.")
         return
 
-    # Build rc_list for PDFs while displaying each roll call lazily
     rc_list = []
     for _, rc in roll_calls.iterrows():
-        result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
-        expander_label = f"{rc['date']} — {rc['description']} ({result_label})"
-
-        # Only load detail data when the expander is opened
-        with st.expander(expander_label):
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Yea", rc["yea"])
-            col2.metric("Nay", rc["nay"])
-            col3.metric("NV/Absent", rc["nv"])
-
-            detail = get_roll_call_detail(int(rc["roll_call_id"]))
-            party_summary = calculate_party_line(detail) if not detail.empty else pd.DataFrame()
-
-            if not party_summary.empty:
-                st.markdown("**Party Line Analysis**")
-                st.dataframe(party_summary, use_container_width=True)
-
-            if not detail.empty:
-                st.markdown("**Individual Votes**")
-                st.dataframe(
-                    detail[["name", "party", "chamber", "district", "vote_text"]].rename(columns={
-                        "name": "Name", "party": "Party",
-                        "chamber": "Chamber", "district": "District",
-                        "vote_text": "Vote"
-                    }),
-                    use_container_width=True
-                )
-
+        detail = get_roll_call_detail(int(rc["roll_call_id"]))
+        party_summary = calculate_party_line(detail) if not detail.empty else pd.DataFrame()
         rc_list.append({
             "date": rc["date"],
             "description": rc["description"],
@@ -357,34 +233,54 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             "yea": rc["yea"],
             "nay": rc["nay"],
             "nv": rc["nv"],
-            "party_summary_df": calculate_party_line(get_roll_call_detail(int(rc["roll_call_id"]))),
-            "detail_df": get_roll_call_detail(int(rc["roll_call_id"]))
+            "party_summary_df": party_summary,
+            "detail_df": detail
         })
 
-    st.subheader("Download Reports")
-    col1, col2, col3 = st.columns(3)
+    for rc in rc_list:
+        result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
+        with st.expander(f"{rc['date']} — {rc['description']} ({result_label})"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Yea", rc["yea"])
+            c2.metric("Nay", rc["nay"])
+            c3.metric("NV/Absent", rc["nv"])
 
-    with col1:
+            if not rc["party_summary_df"].empty:
+                st.markdown("**Party Line Analysis**")
+                st.dataframe(rc["party_summary_df"], use_container_width=True)
+
+            if not rc["detail_df"].empty:
+                st.markdown("**Individual Votes**")
+                st.dataframe(
+                    rc["detail_df"].rename(columns={
+                        "name": "Name", "party": "Party",
+                        "chamber": "Chamber", "district": "District",
+                        "vote_text": "Vote"
+                    }),
+                    use_container_width=True
+                )
+
+    st.subheader("Download Reports")
+    c1, c2, c3 = st.columns(3)
+    with c1:
         if st.button("Generate Bill Vote Report PDF", key=f"vote_pdf_{bill_id}"):
             with st.spinner("Generating PDF..."):
                 pdf = generate_bill_vote_report(bill_number, bill_title, rc_list)
             st.download_button(
                 f"⬇️ Download {bill_number} Vote Report", pdf,
                 file_name=f"{bill_number.replace(' ', '_')}_vote_report.pdf",
-                mime="application/pdf",
-                key=f"dl_vote_{bill_id}"
+                mime="application/pdf", key=f"dl_vote_{bill_id}"
             )
-    with col2:
+    with c2:
         if st.button("Generate Bill Party Line PDF", key=f"party_pdf_{bill_id}"):
             with st.spinner("Generating PDF..."):
                 pdf = generate_bill_party_line_report(bill_number, bill_title, rc_list)
             st.download_button(
                 f"⬇️ Download {bill_number} Party Line", pdf,
                 file_name=f"{bill_number.replace(' ', '_')}_party_line.pdf",
-                mime="application/pdf",
-                key=f"dl_party_{bill_id}"
+                mime="application/pdf", key=f"dl_party_{bill_id}"
             )
-    with col3:
+    with c3:
         if st.button("Generate Both Bill PDFs", key=f"both_pdf_{bill_id}"):
             with st.spinner("Generating PDFs..."):
                 pdf_vote = generate_bill_vote_report(bill_number, bill_title, rc_list)
@@ -392,52 +288,42 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             st.download_button(
                 f"⬇️ Download Vote Report", pdf_vote,
                 file_name=f"{bill_number.replace(' ', '_')}_vote_report.pdf",
-                mime="application/pdf",
-                key=f"dl_both_vote_{bill_id}"
+                mime="application/pdf", key=f"dl_both_vote_{bill_id}"
             )
             st.download_button(
                 f"⬇️ Download Party Line Report", pdf_party,
                 file_name=f"{bill_number.replace(' ', '_')}_party_line.pdf",
-                mime="application/pdf",
-                key=f"dl_both_party_{bill_id}"
+                mime="application/pdf", key=f"dl_both_party_{bill_id}"
             )
 
-# ----------------------- STREAMLIT APP -----------------------
+# ----------------------- SESSION STATE -----------------------
 
 if "selected_bill_id" not in st.session_state:
     st.session_state.selected_bill_id = None
 if "last_search" not in st.session_state:
     st.session_state.last_search = ()
 
-page = st.sidebar.radio(
-    "Navigate",
-    ["Legislator Lookup", "Bill Lookup"]
-)
+# ----------------------- PAGE ROUTING -----------------------
+
+page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup"])
 
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
 if page == "Legislator Lookup":
     st.header("Legislator Voting Record")
 
-    legislators = get_legislators()
-
     if legislators.empty:
         st.warning("No legislators found. Please run fetcher.py first.")
     else:
-        chamber_filter = st.radio(
-            "Filter by chamber",
-            ["Both", "House", "Senate"],
-            horizontal=True
-        )
+        chamber_filter = st.radio("Filter by chamber", ["Both", "House", "Senate"], horizontal=True)
         filtered = legislators if chamber_filter == "Both" else legislators[legislators["chamber"] == chamber_filter]
         filtered = filtered.copy()
         filtered["label"] = filtered.apply(
-            lambda row: f"{row['name']} ({row['party']}) - {row['chamber']} District {row['district']}",
-            axis=1
+            lambda r: f"{r['name']} ({r['party']}) - {r['chamber']} District {r['district']}", axis=1
         )
+
         selected_label = st.selectbox("Select a legislator", filtered["label"].tolist())
         selected_row = filtered[filtered["label"] == selected_label].iloc[0]
-
         people_id = int(selected_row["people_id"])
         name = selected_row["name"]
         party = selected_row["party"]
@@ -457,56 +343,43 @@ if page == "Legislator Lookup":
         if record.empty:
             st.info("No votes on record for this legislator yet.")
         else:
-            record["Result"] = record["passed"].apply(
-                lambda x: "✅ Passed" if x == 1 else "❌ Failed"
+            record["Result"] = record["passed"].apply(lambda x: "✅ Passed" if x == 1 else "❌ Failed")
+            st.dataframe(
+                record[["bill_number", "title", "date", "description", "Result", "vote_text"]].rename(columns={
+                    "bill_number": "Bill", "title": "Title", "date": "Date",
+                    "description": "Vote Description", "vote_text": "Vote Cast"
+                }),
+                use_container_width=True
             )
-            display = record[[
-                "bill_number", "title", "date", "description", "Result", "vote_text"
-            ]].rename(columns={
-                "bill_number": "Bill",
-                "title": "Title",
-                "date": "Date",
-                "description": "Vote Description",
-                "vote_text": "Vote Cast"
-            })
-            st.dataframe(display, use_container_width=True)
 
         st.subheader("Download Reports")
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        with col1:
+        with c1:
             if st.button("Generate Voting Record PDF"):
                 with st.spinner("Generating PDF..."):
-                    pdf = generate_legislator_voting_record(
-                        name, party, chamber, district, summary, record
-                    )
+                    pdf = generate_legislator_voting_record(name, party, chamber, district, summary, record)
                 st.download_button(
                     f"⬇️ Download {name} Voting Record", pdf,
                     file_name=f"{name.replace(' ', '_')}_voting_record.pdf",
                     mime="application/pdf"
                 )
-        with col2:
+        with c2:
             if st.button("Generate Party Line Report PDF"):
-                with st.spinner("Analyzing party votes... this may take a moment"):
-                    party_line_df = build_legislator_party_line_df(people_id, party, record)
-                    pdf = generate_legislator_party_line_report(
-                        name, party, chamber, district, party_line_df
-                    )
+                with st.spinner("Analyzing party votes..."):
+                    pl_df = build_legislator_party_line_df(people_id, party, record)
+                    pdf = generate_legislator_party_line_report(name, party, chamber, district, pl_df)
                 st.download_button(
                     f"⬇️ Download {name} Party Line", pdf,
                     file_name=f"{name.replace(' ', '_')}_party_line.pdf",
                     mime="application/pdf"
                 )
-        with col3:
+        with c3:
             if st.button("Generate Both Reports PDF"):
                 with st.spinner("Generating both PDFs..."):
-                    party_line_df = build_legislator_party_line_df(people_id, party, record)
-                    pdf_vr = generate_legislator_voting_record(
-                        name, party, chamber, district, summary, record
-                    )
-                    pdf_pl = generate_legislator_party_line_report(
-                        name, party, chamber, district, party_line_df
-                    )
+                    pl_df = build_legislator_party_line_df(people_id, party, record)
+                    pdf_vr = generate_legislator_voting_record(name, party, chamber, district, summary, record)
+                    pdf_pl = generate_legislator_party_line_report(name, party, chamber, district, pl_df)
                 st.download_button(
                     f"⬇️ Download Voting Record", pdf_vr,
                     file_name=f"{name.replace(' ', '_')}_voting_record.pdf",
@@ -523,7 +396,11 @@ if page == "Legislator Lookup":
 elif page == "Bill Lookup":
     st.header("Bill Search")
 
-    sessions, statuses, committees, sponsors = get_bill_search_filters()
+    # Build filter options from in-memory data
+    session_options = sorted(bills["session"].dropna().unique().tolist(), reverse=True)
+    status_options = sorted(bills["status"].dropna().unique().tolist())
+    committee_options = sorted(committees["committee_name"].dropna().unique().tolist()) if not committees.empty else []
+    sponsor_options = sorted(sponsors["name"].dropna().unique().tolist()) if not sponsors.empty else []
 
     with st.expander("Search & Filter", expanded=True):
         col1, col2 = st.columns(2)
@@ -532,10 +409,10 @@ elif page == "Bill Lookup":
             title_query = st.text_input("Keyword in Title", placeholder="e.g. education")
             chamber_filter = st.radio("Chamber", ["All", "House", "Senate"], horizontal=True)
         with col2:
-            status_filter = st.selectbox("Status", ["All"] + statuses)
-            session_filter = st.selectbox("Session", ["All"] + sessions)
-            committee_filter = st.selectbox("Committee", ["All"] + committees)
-            sponsor_filter = st.selectbox("Sponsor", ["All"] + sponsors)
+            status_filter = st.selectbox("Status", ["All"] + status_options)
+            session_filter = st.selectbox("Session", ["All"] + session_options)
+            committee_filter = st.selectbox("Committee", ["All"] + committee_options)
+            sponsor_filter = st.selectbox("Sponsor", ["All"] + sponsor_options)
 
     current_search = (
         bill_number_query, title_query, chamber_filter,
@@ -570,12 +447,17 @@ elif page == "Bill Lookup":
             cols[4].write(row["session"] or "—")
             if cols[5].button("View", key=f"view_{row['bill_id']}"):
                 st.session_state.selected_bill_id = int(row["bill_id"])
+                st.rerun()
 
         if st.session_state.selected_bill_id:
-            bill_row = get_bill_by_id(st.session_state.selected_bill_id)
-            if bill_row is not None:
+            matched = bills[bills["bill_id"] == st.session_state.selected_bill_id]
+            if not matched.empty:
+                bill_row = matched.iloc[0]
                 st.divider()
                 st.subheader(f"📄 {bill_row['bill_number']} — {bill_row['title']}")
+                if st.button("← Back to results"):
+                    st.session_state.selected_bill_id = None
+                    st.rerun()
                 render_bill_detail(
                     int(bill_row["bill_id"]),
                     bill_row["bill_number"],
