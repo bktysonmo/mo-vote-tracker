@@ -69,6 +69,61 @@ def load_all_data():
 
 legislators, bills, votes, member_votes, member_votes_full, sponsors, committees = load_all_data()
 
+@st.cache_resource
+def load_history_data():
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect("mo_history.db", check_same_thread=False)
+        conn.row_factory = _sqlite3.Row
+
+        h_sessions = pd.read_sql_query(
+            "SELECT session_id, session_name, year, special FROM sessions ORDER BY year DESC",
+            conn
+        )
+        h_bills = pd.read_sql_query(
+            "SELECT bill_id, session_id, session_name, bill_number, title, status, chamber, url FROM bills",
+            conn
+        )
+        h_votes = pd.read_sql_query(
+            "SELECT roll_call_id, bill_id, session_id, date, description, yea, nay, nv, passed, chamber FROM votes",
+            conn
+        )
+        h_member_votes = pd.read_sql_query(
+            "SELECT roll_call_id, people_id, session_id, vote_text FROM member_votes",
+            conn
+        )
+        h_legislators = pd.read_sql_query(
+            "SELECT DISTINCT people_id, name, party, chamber, currently_serving FROM legislators",
+            conn
+        )
+        # For legislators seen in multiple sessions, keep most recent record
+        h_legislators = h_legislators.sort_values("currently_serving", ascending=False)
+        h_legislators = h_legislators.drop_duplicates(subset="people_id", keep="first")
+
+        h_sponsors = pd.read_sql_query(
+            "SELECT bill_id, session_id, name, sponsor_type, people_id FROM sponsors",
+            conn
+        )
+        h_similar = pd.read_sql_query(
+            "SELECT bill_id, similar_bill_id, similar_number, similar_title, similar_session FROM similar_bills",
+            conn
+        )
+
+        # Full member votes with legislator info merged in
+        h_member_votes_full = h_member_votes.merge(
+            h_legislators[["people_id", "name", "party", "chamber", "currently_serving"]],
+            on="people_id", how="left"
+        )
+
+        conn.close()
+        return h_sessions, h_bills, h_votes, h_member_votes, h_member_votes_full, h_legislators, h_sponsors, h_similar
+
+    except Exception as e:
+        st.error(f"Could not load historical database: {e}")
+        return [pd.DataFrame()] * 8
+
+h_sessions, h_bills, h_votes, h_member_votes, h_member_votes_full, h_legislators, h_sponsors, h_similar = load_history_data()
+
 # ----------------------- HELPER FUNCTIONS -----------------------
 # These all operate on in-memory dataframes — no database queries
 
@@ -305,8 +360,7 @@ if "last_search" not in st.session_state:
 
 # ----------------------- PAGE ROUTING -----------------------
 
-page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup"])
-
+page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup", "Historical Search"])
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
 if page == "Legislator Lookup":
@@ -391,12 +445,10 @@ if page == "Legislator Lookup":
                     mime="application/pdf"
                 )
 
-# ----------------------- BILL LOOKUP -----------------------
-
+# ----------------------- BILL LOOKUP ----------------------
 elif page == "Bill Lookup":
     st.header("Bill Search")
 
-    # Build filter options from in-memory data
     session_options = sorted(bills["session"].dropna().unique().tolist(), reverse=True)
     status_options = sorted(bills["status"].dropna().unique().tolist())
     committee_options = sorted(committees["committee_name"].dropna().unique().tolist()) if not committees.empty else []
@@ -414,53 +466,434 @@ elif page == "Bill Lookup":
             committee_filter = st.selectbox("Committee", ["All"] + committee_options)
             sponsor_filter = st.selectbox("Sponsor", ["All"] + sponsor_options)
 
-    current_search = (
-        bill_number_query, title_query, chamber_filter,
-        status_filter, session_filter, committee_filter, sponsor_filter
-    )
-    if current_search != st.session_state.last_search:
-        st.session_state.selected_bill_id = None
-        st.session_state.last_search = current_search
-
     results = search_bills(
         bill_number_query, title_query, chamber_filter,
         status_filter, session_filter, committee_filter, sponsor_filter
     )
 
-    st.caption(f"{len(results)} bill(s) found")
+    st.caption(f"{len(results)} bill(s) found — click any row to view details")
 
     if results.empty:
         st.info("No bills match your search. Try adjusting your filters.")
     else:
-        st.markdown("#### Results")
-        header_cols = st.columns([1, 3, 1, 1, 2, 1])
-        for col, label in zip(header_cols, ["**Bill**", "**Title**", "**Chamber**", "**Status**", "**Session**", ""]):
-            col.markdown(label)
-        st.divider()
+        display_results = results[["bill_number", "title", "chamber", "status", "session"]].rename(columns={
+            "bill_number": "Bill",
+            "title": "Title",
+            "chamber": "Chamber",
+            "status": "Status",
+            "session": "Session"
+        }).reset_index(drop=True)
 
-        for _, row in results.iterrows():
-            cols = st.columns([1, 3, 1, 1, 2, 1])
-            cols[0].write(row["bill_number"])
-            cols[1].write(row["title"])
-            cols[2].write(row["chamber"] or "—")
-            cols[3].write(row["status"] or "—")
-            cols[4].write(row["session"] or "—")
-            if cols[5].button("View", key=f"view_{row['bill_id']}"):
-                st.session_state.selected_bill_id = int(row["bill_id"])
-                st.rerun()
+        # on_select="rerun" makes clicking a row immediately trigger the detail view
+        # selection_mode="single-row" means only one row can be selected at a time
+        selected = st.dataframe(
+            display_results,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
 
-        if st.session_state.selected_bill_id:
-            matched = bills[bills["bill_id"] == st.session_state.selected_bill_id]
-            if not matched.empty:
-                bill_row = matched.iloc[0]
+        # selected.selection.rows is a list of selected row indices
+        if selected.selection.rows:
+            row_index = selected.selection.rows[0]
+            selected_bill = results.iloc[row_index]
+            st.divider()
+            st.subheader(f"📄 {selected_bill['bill_number']} — {selected_bill['title']}")
+            render_bill_detail(
+                int(selected_bill["bill_id"]),
+                selected_bill["bill_number"],
+                selected_bill["title"],
+                selected_bill
+            )
+# ----------------------- HISTORICAL SEARCH -----------------------
+
+elif page == "Historical Search":
+    st.header("Historical Legislative Search")
+    st.caption("Searching all Missouri legislative sessions from 2010 to present")
+
+    hist_tab1, hist_tab2, hist_tab3 = st.tabs([
+        "Bill Search", "Legislator History", "Party Rank Patterns"
+    ])
+
+    # ---- HISTORICAL BILL SEARCH ----
+    with hist_tab1:
+        st.subheader("Search Bills Across All Sessions")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            h_keyword = st.text_input("Keyword in title", placeholder="e.g. education, tax, abortion")
+            h_bill_num = st.text_input("Bill number", placeholder="e.g. HB 42")
+        with col2:
+            h_year = st.selectbox(
+                "Year",
+                ["All"] + sorted(h_sessions["year"].unique().tolist(), reverse=True)
+            )
+            h_session_type = st.radio(
+                "Session type",
+                ["All", "Regular only", "Special only"],
+                horizontal=True
+            )
+            h_status = st.selectbox(
+                "Status",
+                ["All"] + sorted(h_bills["status"].dropna().unique().tolist())
+            )
+
+        # Filter bills
+        h_results = h_bills.copy()
+        if h_keyword:
+            h_results = h_results[h_results["title"].str.contains(h_keyword, case=False, na=False)]
+        if h_bill_num:
+            h_results = h_results[h_results["bill_number"].str.contains(h_bill_num, case=False, na=False)]
+        if h_year != "All":
+            matching_sessions = h_sessions[h_sessions["year"] == int(h_year)]["session_id"].tolist()
+            h_results = h_results[h_results["session_id"].isin(matching_sessions)]
+        if h_session_type == "Regular only":
+            reg_ids = h_sessions[h_sessions["special"] == 0]["session_id"].tolist()
+            h_results = h_results[h_results["session_id"].isin(reg_ids)]
+        elif h_session_type == "Special only":
+            spec_ids = h_sessions[h_sessions["special"] == 1]["session_id"].tolist()
+            h_results = h_results[h_results["session_id"].isin(spec_ids)]
+        if h_status != "All":
+            h_results = h_results[h_results["status"] == h_status]
+
+        h_results = h_results.head(300)
+        st.caption(f"{len(h_results)} bill(s) found")
+
+        if not h_results.empty:
+            display = h_results[[
+                "bill_number", "title", "session_name", "status", "chamber"
+            ]].rename(columns={
+                "bill_number": "Bill",
+                "title": "Title",
+                "session_name": "Session",
+                "status": "Status",
+                "chamber": "Chamber"
+            }).reset_index(drop=True)
+
+            selected = st.dataframe(
+                display,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row"
+            )
+
+            if selected.selection.rows:
+                row_index = selected.selection.rows[0]
+                sel_bill = h_results.iloc[row_index]
+                bill_id = int(sel_bill["bill_id"])
+                session_id = int(sel_bill["session_id"])
+
                 st.divider()
-                st.subheader(f"📄 {bill_row['bill_number']} — {bill_row['title']}")
-                if st.button("← Back to results"):
-                    st.session_state.selected_bill_id = None
-                    st.rerun()
-                render_bill_detail(
-                    int(bill_row["bill_id"]),
-                    bill_row["bill_number"],
-                    bill_row["title"],
-                    bill_row
-                )
+                st.subheader(f"📄 {sel_bill['bill_number']} — {sel_bill['title']}")
+                st.caption(f"{sel_bill['session_name']} | {sel_bill['status']} | {sel_bill['chamber']}")
+
+                if sel_bill["url"]:
+                    st.caption(f"[View on LegiScan]({sel_bill['url']})")
+
+                # Sponsors
+                bill_sponsors = h_sponsors[h_sponsors["bill_id"] == bill_id]
+                if not bill_sponsors.empty:
+                    primary = bill_sponsors[bill_sponsors["sponsor_type"] == "Primary"]["name"].tolist()
+                    cospon = bill_sponsors[bill_sponsors["sponsor_type"] == "Co-Sponsor"]["name"].tolist()
+                    if primary:
+                        st.markdown(f"**Primary Sponsor:** {', '.join(primary)}")
+                    if cospon:
+                        st.markdown(f"**Co-Sponsors:** {', '.join(cospon)}")
+
+                # Similar bills across sessions
+                similar = h_similar[h_similar["bill_id"] == bill_id]
+                if not similar.empty:
+                    st.markdown("**Similar Bills in Other Sessions:**")
+                    for _, sb in similar.iterrows():
+                        st.markdown(f"- {sb['similar_number']} ({sb['similar_session']}) — {sb['similar_title']}")
+
+                # Roll calls
+                bill_votes = h_votes[h_votes["bill_id"] == bill_id]
+                if bill_votes.empty:
+                    st.info("No recorded roll call votes for this bill.")
+                else:
+                    for _, rc in bill_votes.iterrows():
+                        result = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
+                        with st.expander(f"{rc['date']} — {rc['description']} ({result})"):
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Yea", rc["yea"])
+                            c2.metric("Nay", rc["nay"])
+                            c3.metric("NV/Absent", rc["nv"])
+
+                            detail = h_member_votes_full[
+                                h_member_votes_full["roll_call_id"] == rc["roll_call_id"]
+                            ].copy()
+
+                            if not detail.empty:
+                                party_summary = calculate_party_line(detail)
+                                if not party_summary.empty:
+                                    st.markdown("**Party Line Analysis**")
+                                    st.dataframe(party_summary, use_container_width=True)
+
+                                st.markdown("**Individual Votes**")
+                                st.dataframe(
+                                    detail[["name", "party", "chamber", "vote_text"]].rename(columns={
+                                        "name": "Name", "party": "Party",
+                                        "chamber": "Chamber", "vote_text": "Vote"
+                                    }),
+                                    use_container_width=True
+                                )
+
+    # ---- LEGISLATOR HISTORY ----
+    with hist_tab2:
+        st.subheader("Legislator Voting History Across Sessions")
+
+        # Filter to unique legislators
+        serving_filter = st.radio(
+            "Show",
+            ["All legislators", "Currently serving only", "Former legislators only"],
+            horizontal=True
+        )
+
+        if serving_filter == "Currently serving only":
+            leg_pool = h_legislators[h_legislators["currently_serving"] == 1]
+        elif serving_filter == "Former legislators only":
+            leg_pool = h_legislators[h_legislators["currently_serving"] == 0]
+        else:
+            leg_pool = h_legislators
+
+        leg_pool = leg_pool.copy().sort_values("name")
+        leg_pool["label"] = leg_pool.apply(
+            lambda r: f"{r['name']} ({r['party']}) — {'Currently Serving' if r['currently_serving'] == 1 else 'Former'}",
+            axis=1
+        )
+
+        selected_leg = st.selectbox("Select a legislator", leg_pool["label"].tolist())
+        sel_leg_row = leg_pool[leg_pool["label"] == selected_leg].iloc[0]
+        sel_people_id = int(sel_leg_row["people_id"])
+
+        # Get all their votes across all sessions
+        leg_votes = h_member_votes_full[
+            h_member_votes_full["people_id"] == sel_people_id
+        ].merge(h_votes, on="roll_call_id", how="left") \
+         .merge(h_bills[["bill_id", "bill_number", "title", "session_name"]], on="bill_id", how="left")
+
+        if leg_votes.empty:
+            st.info("No voting history found for this legislator.")
+        else:
+            # Summary by session
+            st.markdown("#### Sessions Served")
+            session_summary = leg_votes.groupby("session_name").agg(
+                total_votes=("vote_text", "count"),
+                yea=("vote_text", lambda x: (x == "Yea").sum()),
+                nay=("vote_text", lambda x: (x == "Nay").sum()),
+                nv=("vote_text", lambda x: x.isin(["NV", "Absent"]).sum())
+            ).reset_index().rename(columns={
+                "session_name": "Session",
+                "total_votes": "Total Votes",
+                "yea": "Yea",
+                "nay": "Nay",
+                "nv": "NV/Absent"
+            })
+            st.dataframe(session_summary, use_container_width=True)
+
+            # Full vote history
+            st.markdown("#### Full Vote History")
+            full_display = leg_votes[[
+                "bill_number", "title", "session_name", "date", "description", "vote_text_x"
+            ]].rename(columns={
+                "bill_number": "Bill",
+                "title": "Title",
+                "session_name": "Session",
+                "date": "Date",
+                "description": "Description",
+                "vote_text_x": "Vote"
+            }).sort_values("Date", ascending=False).reset_index(drop=True)
+
+            st.dataframe(full_display, use_container_width=True)
+
+    # ---- PARTY RANK PATTERNS ----
+    with hist_tab3:
+        st.subheader("Cross-Session Party Rank Patterns")
+        st.caption("Find legislators with a pattern of breaking party rank on similar legislation across multiple sessions")
+
+        pr_mode = st.radio(
+            "Analyze by",
+            ["Legislator", "Topic keyword"],
+            horizontal=True
+        )
+
+        if pr_mode == "Legislator":
+            serving_filter2 = st.radio(
+                "Show",
+                ["All", "Currently serving", "Former"],
+                horizontal=True,
+                key="pr_serving"
+            )
+            if serving_filter2 == "Currently serving":
+                pr_leg_pool = h_legislators[h_legislators["currently_serving"] == 1]
+            elif serving_filter2 == "Former":
+                pr_leg_pool = h_legislators[h_legislators["currently_serving"] == 0]
+            else:
+                pr_leg_pool = h_legislators
+
+            pr_leg_pool = pr_leg_pool.copy().sort_values("name")
+            pr_leg_pool["label"] = pr_leg_pool.apply(
+                lambda r: f"{r['name']} ({r['party']}) — {'Currently Serving' if r['currently_serving'] == 1 else 'Former'}",
+                axis=1
+            )
+
+            pr_selected = st.selectbox("Select a legislator", pr_leg_pool["label"].tolist(), key="pr_leg")
+            pr_sel_row = pr_leg_pool[pr_leg_pool["label"] == pr_selected].iloc[0]
+            pr_people_id = int(pr_sel_row["people_id"])
+            pr_party = pr_sel_row["party"]
+
+            if st.button("Calculate Party Rank Pattern"):
+                with st.spinner("Analyzing voting history across all sessions..."):
+                    # Get all votes for this legislator
+                    pr_votes = h_member_votes[
+                        h_member_votes["people_id"] == pr_people_id
+                    ].merge(h_votes, on="roll_call_id", how="left") \
+                     .merge(h_bills[["bill_id", "bill_number", "title", "session_name"]], on="bill_id", how="left")
+
+                    if pr_votes.empty:
+                        st.info("No voting history found.")
+                    else:
+                        rows = []
+                        for _, vote_row in pr_votes.iterrows():
+                            rc_id = vote_row["roll_call_id"]
+                            # Get all votes on this roll call
+                            all_rc_votes = h_member_votes_full[
+                                h_member_votes_full["roll_call_id"] == rc_id
+                            ]
+                            party_votes = all_rc_votes[all_rc_votes["party"] == pr_party]
+                            if party_votes.empty:
+                                continue
+                            yea = (party_votes["vote_text"] == "Yea").sum()
+                            nay = (party_votes["vote_text"] == "Nay").sum()
+                            total = len(party_votes)
+                            party_line = "Yea" if yea >= nay else "Nay"
+                            unity = round((max(yea, nay) / total) * 100, 1) if total > 0 else 0
+                            member_vote = vote_row["vote_text_x"] if "vote_text_x" in vote_row else vote_row.get("vote_text", "")
+                            broke = member_vote in ["Yea", "Nay"] and member_vote != party_line
+                            rows.append({
+                                "Session": vote_row.get("session_name", ""),
+                                "Bill": vote_row.get("bill_number", ""),
+                                "Title": vote_row.get("title", ""),
+                                "Party Line": party_line,
+                                "Member Vote": member_vote,
+                                "Broke Rank": "YES" if broke else "No",
+                                "Party Unity %": unity
+                            })
+
+                        if not rows:
+                            st.info("Could not calculate party line data.")
+                        else:
+                            pattern_df = pd.DataFrame(rows)
+                            broke_df = pattern_df[pattern_df["Broke Rank"] == "YES"]
+
+                            # Summary metrics
+                            total_rc = len(pattern_df[pattern_df["Member Vote"].isin(["Yea", "Nay"])])
+                            total_broke = len(broke_df)
+                            unity_score = round(((total_rc - total_broke) / total_rc) * 100, 1) if total_rc > 0 else 0
+
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Overall Party Unity Score", f"{unity_score}%")
+                            c2.metric("Times Broke Rank", total_broke)
+                            c3.metric("Total Votes Analyzed", total_rc)
+
+                            serving_label = "Currently Serving" if pr_sel_row["currently_serving"] == 1 else "Former Legislator"
+                            st.caption(f"{pr_sel_row['name']} | {pr_party} | {serving_label}")
+
+                            if not broke_df.empty:
+                                st.markdown("#### Votes Where Member Broke Party Rank")
+                                st.dataframe(
+                                    broke_df[["Session", "Bill", "Title", "Party Line", "Member Vote", "Party Unity %"]],
+                                    use_container_width=True
+                                )
+
+                            st.markdown("#### Full Cross-Session Vote History")
+                            st.dataframe(pattern_df, use_container_width=True)
+
+        elif pr_mode == "Topic keyword":
+            topic = st.text_input("Enter a topic keyword", placeholder="e.g. abortion, tax, guns, education")
+
+            if topic and st.button("Find Party Rank Breakers"):
+                with st.spinner(f"Searching for '{topic}' votes across all sessions..."):
+                    # Find all bills matching the topic
+                    topic_bills = h_bills[
+                        h_bills["title"].str.contains(topic, case=False, na=False)
+                    ]
+                    topic_vote_ids = h_votes[
+                        h_votes["bill_id"].isin(topic_bills["bill_id"])
+                    ]["roll_call_id"].tolist()
+
+                    if not topic_vote_ids:
+                        st.info(f"No votes found for bills matching '{topic}'.")
+                    else:
+                        # Get all member votes on these roll calls
+                        topic_mv = h_member_votes_full[
+                            h_member_votes_full["roll_call_id"].isin(topic_vote_ids)
+                        ].merge(
+                            h_votes[["roll_call_id", "bill_id", "date", "session_id"]],
+                            on="roll_call_id", how="left"
+                        ).merge(
+                            h_bills[["bill_id", "bill_number", "title", "session_name"]],
+                            on="bill_id", how="left"
+                        )
+
+                        # For each roll call, calculate party line and find breakers
+                        breaker_rows = []
+                        for rc_id in topic_vote_ids:
+                            rc_votes = topic_mv[topic_mv["roll_call_id"] == rc_id]
+                            if rc_votes.empty:
+                                continue
+                            bill_info = rc_votes.iloc[0]
+
+                            for party in rc_votes["party"].dropna().unique():
+                                if party == "":
+                                    continue
+                                pv = rc_votes[rc_votes["party"] == party]
+                                yea = (pv["vote_text"] == "Yea").sum()
+                                nay = (pv["vote_text"] == "Nay").sum()
+                                total = len(pv)
+                                if total == 0:
+                                    continue
+                                party_line = "Yea" if yea >= nay else "Nay"
+                                unity = round((max(yea, nay) / total) * 100, 1)
+
+                                breakers = pv[
+                                    (pv["vote_text"].isin(["Yea", "Nay"])) &
+                                    (pv["vote_text"] != party_line)
+                                ]
+                                for _, br in breakers.iterrows():
+                                    serving = "Currently Serving" if br.get("currently_serving") == 1 else "Former"
+                                    breaker_rows.append({
+                                        "Session": bill_info.get("session_name", ""),
+                                        "Bill": bill_info.get("bill_number", ""),
+                                        "Title": bill_info.get("title", ""),
+                                        "Legislator": br["name"],
+                                        "Party": party,
+                                        "Status": serving,
+                                        "Party Line": party_line,
+                                        "Their Vote": br["vote_text"],
+                                        "Party Unity %": unity
+                                    })
+
+                        if not breaker_rows:
+                            st.info("No party rank breaks found for this topic.")
+                        else:
+                            breaker_df = pd.DataFrame(breaker_rows)
+
+                            st.markdown(f"#### Party Rank Breakers on '{topic}' Bills")
+                            st.caption(f"{len(breaker_df)} instances of breaking rank across {len(topic_vote_ids)} roll calls")
+
+                            # Show who broke rank most often
+                            repeat_breakers = breaker_df.groupby(
+                                ["Legislator", "Party", "Status"]
+                            ).size().reset_index(name="Times Broke Rank") \
+                             .sort_values("Times Broke Rank", ascending=False)
+
+                            st.markdown("**Repeat Rank Breakers (sorted by frequency)**")
+                            st.dataframe(repeat_breakers, use_container_width=True)
+
+                            st.markdown("**All Individual Instances**")
+                            st.dataframe(
+                                breaker_df.sort_values(["Legislator", "Session"]),
+                                use_container_width=True
+                            )
