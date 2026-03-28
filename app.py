@@ -1,6 +1,3 @@
-Here's the complete updated `app.py` with all the new features added — official similar bills, bill summaries, similar bill title matching, and the party rank drill-down:
-
-```python
 import streamlit as st
 import pandas as pd
 import sqlite3
