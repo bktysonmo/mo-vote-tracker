@@ -13,7 +13,6 @@ load_dotenv()
 API_KEY = os.getenv("LEGISCAN_API_KEY")
 BASE_URL = "https://api.legiscan.com/"
 
-# All 31 Missouri sessions with their access keys
 ALL_SESSIONS = [
     (2239, "2026 Regular Session", 2026, 0, "6UzBHz4T6KinkHtOIQfrUK"),
     (2226, "2025 2nd Special Session", 2025, 1, "3HeWdk06sDfZCwL7Qycwse"),
@@ -65,7 +64,6 @@ def legiscan_call(op, **params):
     return data
 
 def get_current_people_ids():
-    # Fetch current session legislators so we can mark currently_serving
     print("Fetching current session legislators for 'currently serving' flag...")
     data = legiscan_call("getSessionPeople", id=CURRENT_SESSION_ID)
     people = data.get("sessionpeople", {}).get("people", [])
@@ -87,171 +85,193 @@ def mark_session_complete(conn, session_id):
     """, (session_id,))
     conn.commit()
 
-def download_and_parse_dataset(session_id, session_name, access_key):
-    # getDataset returns a base64-encoded ZIP file
-    # base64 = a way of encoding binary data (like a ZIP) as plain text for transport
-    # We decode it back to bytes, then unzip it in memory
+def download_zip(session_id, session_name, access_key):
     print(f"  Downloading dataset for {session_name}...")
     data = legiscan_call("getDataset", id=session_id, access_key=access_key)
-
-    dataset = data.get("dataset", {})
-    zip_b64 = dataset.get("zip", "")
-
+    zip_b64 = data.get("dataset", {}).get("zip", "")
     if not zip_b64:
-        print(f"  No zip data returned for {session_name}")
-        return []
-
-    # Decode base64 → bytes → open as ZIP in memory (no file saved to disk)
+        print(f"  No zip data returned.")
+        return None
     zip_bytes = base64.b64decode(zip_b64)
-    zip_buffer = io.BytesIO(zip_bytes)
-
-    bills = []
-    with zipfile.ZipFile(zip_buffer, "r") as zf:
-        file_list = zf.namelist()
-        # Each file in the ZIP is a JSON payload for one bill
-        bill_files = [f for f in file_list if f.endswith(".json") and "/bill/" in f]
-        print(f"  Found {len(bill_files)} bill files in ZIP.")
-
-        for fname in bill_files:
-            try:
-                with zf.open(fname) as f:
-                    payload = json.load(f)
-                    # Dataset JSONs are wrapped in {"bill": {...}}
-                    bill = payload.get("bill", payload)
-                    bills.append(bill)
-            except Exception as e:
-                print(f"  Warning: could not parse {fname}: {e}")
-                continue
-
-    return bills
+    return io.BytesIO(zip_bytes)
 
 def store_session_data(conn, session_id, session_name, year, special,
-                       bills, current_people_ids):
+                       zip_buffer, current_people_ids):
     c = conn.cursor()
 
-    # Store session metadata
     c.execute("""
         INSERT OR REPLACE INTO sessions (session_id, session_name, year, special)
         VALUES (?, ?, ?, ?)
     """, (session_id, session_name, year, special))
 
-    legislators_seen = {}  # people_id → person dict, to avoid duplicate inserts
+    legislators_seen = {}
 
-    for bill in bills:
-        bill_id = bill.get("bill_id")
-        if not bill_id:
-            continue
+    with zipfile.ZipFile(zip_buffer, "r") as zf:
+        all_files = zf.namelist()
 
-        # --- Bill ---
-        status_num = bill.get("status", 1)
-        status_text = STATUS_MAP.get(status_num, "Introduced")
-        body_id = bill.get("body_id", 0)
-        chamber = "House" if body_id == 1 else "Senate" if body_id == 2 else ""
+        bill_files  = [f for f in all_files if "/bill/" in f   and f.endswith(".json")]
+        vote_files  = [f for f in all_files if "/vote/" in f   and f.endswith(".json")]
+        people_files= [f for f in all_files if "/people/" in f and f.endswith(".json")]
 
-        c.execute("""
-            INSERT OR REPLACE INTO bills
-                (bill_id, session_id, session_name, bill_number, title, status, chamber, url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            bill_id, session_id, session_name,
-            bill.get("bill_number", ""),
-            bill.get("title", ""),
-            status_text, chamber,
-            bill.get("state_link", "")
-        ))
+        print(f"  Found {len(bill_files)} bills, {len(vote_files)} votes, {len(people_files)} people files.")
 
-        # --- Sponsors ---
-        for sponsor in bill.get("sponsors", []):
-            pid = sponsor.get("people_id", 0)
-            stype = "Primary" if sponsor.get("sponsor_type_id") == 1 else "Co-Sponsor"
-            c.execute("""
-                INSERT OR IGNORE INTO sponsors
-                    (bill_id, session_id, name, sponsor_type, people_id)
-                VALUES (?, ?, ?, ?, ?)
-            """, (bill_id, session_id, sponsor.get("name", ""), stype, pid))
-
-            # Collect legislator data from sponsor records
-            if pid and pid not in legislators_seen:
-                legislators_seen[pid] = {
-                    "people_id": pid,
-                    "name": sponsor.get("name", ""),
-                    "party": sponsor.get("party", ""),
-                    "role": sponsor.get("role", ""),
-                    "district": str(sponsor.get("district", "")),
-                }
-
-        # --- Committee ---
-        committee_raw = bill.get("committee", {})
-        if isinstance(committee_raw, list):
-            committee = committee_raw[0] if committee_raw else {}
-        else:
-            committee = committee_raw or {}
-        committee_name = committee.get("name", "").strip()
-        if committee_name:
-            c.execute("""
-                INSERT OR IGNORE INTO committees
-                    (bill_id, session_id, committee_name, chamber)
-                VALUES (?, ?, ?, ?)
-            """, (bill_id, session_id, committee_name, chamber))
-
-        # --- Similar bills ---
-        for sb in bill.get("similar", []):
-            c.execute("""
-                INSERT OR IGNORE INTO similar_bills
-                    (bill_id, similar_bill_id, similar_number, similar_title, similar_session)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                bill_id,
-                sb.get("bill_id", 0),
-                sb.get("bill_number", ""),
-                sb.get("title", ""),
-                sb.get("session", "")
-            ))
-
-        # --- Roll calls and member votes ---
-        for rc in bill.get("votes", []):
-            roll_call_id = rc.get("roll_call_id")
-            if not roll_call_id:
-                continue
-            rc_chamber = rc.get("chamber", "")
-            c.execute("""
-                INSERT OR REPLACE INTO votes
-                    (roll_call_id, bill_id, session_id, date, description,
-                     yea, nay, nv, passed, chamber)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                roll_call_id, bill_id, session_id,
-                rc.get("date", ""),
-                rc.get("desc", ""),
-                rc.get("yea", 0),
-                rc.get("nay", 0),
-                rc.get("absent", 0) + rc.get("nv", 0),
-                rc.get("passed", 0),
-                rc_chamber
-            ))
-
-            for mv in rc.get("votes", []):
-                pid = mv.get("people_id")
-                c.execute("""
-                    INSERT OR IGNORE INTO member_votes
-                        (roll_call_id, people_id, session_id, vote_text)
-                    VALUES (?, ?, ?, ?)
-                """, (roll_call_id, pid, session_id, mv.get("vote_text", "")))
-
-                # Collect legislator info from vote records too
-                if pid and pid not in legislators_seen:
+        # ---- PEOPLE ----
+        # Parse people files first so we have rich legislator data
+        for fname in people_files:
+            try:
+                with zf.open(fname) as f:
+                    payload = json.load(f)
+                person = payload.get("person", payload)
+                pid = person.get("people_id")
+                if pid:
                     legislators_seen[pid] = {
                         "people_id": pid,
-                        "name": mv.get("name", ""),
-                        "party": mv.get("party", ""),
-                        "role": "",
-                        "district": "",
+                        "name": person.get("name", ""),
+                        "party": person.get("party", ""),
+                        "role": person.get("role", ""),
+                        "district": str(person.get("district", "")),
+                        "chamber": "House" if person.get("role") == "Rep" else "Senate" if person.get("role") == "Sen" else "",
                     }
+            except Exception as e:
+                continue
 
-    # --- Store all legislators seen in this session ---
+        # ---- BILLS ----
+        for fname in bill_files:
+            try:
+                with zf.open(fname) as f:
+                    payload = json.load(f)
+                bill = payload.get("bill", payload)
+                bill_id = bill.get("bill_id")
+                if not bill_id:
+                    continue
+
+                status_text = STATUS_MAP.get(bill.get("status", 1), "Introduced")
+                body_id = bill.get("body_id", 0)
+                chamber = "House" if body_id == 1 else "Senate" if body_id == 2 else ""
+
+                c.execute("""
+                    INSERT OR REPLACE INTO bills
+                        (bill_id, session_id, session_name, bill_number, title, status, chamber, url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    bill_id, session_id, session_name,
+                    bill.get("bill_number", ""),
+                    bill.get("title", ""),
+                    status_text, chamber,
+                    bill.get("state_link", "")
+                ))
+
+                # Sponsors
+                for sponsor in bill.get("sponsors", []):
+                    pid = sponsor.get("people_id", 0)
+                    stype = "Primary" if sponsor.get("sponsor_type_id") == 1 else "Co-Sponsor"
+                    c.execute("""
+                        INSERT OR IGNORE INTO sponsors
+                            (bill_id, session_id, name, sponsor_type, people_id)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (bill_id, session_id, sponsor.get("name", ""), stype, pid))
+                    if pid and pid not in legislators_seen:
+                        legislators_seen[pid] = {
+                            "people_id": pid,
+                            "name": sponsor.get("name", ""),
+                            "party": sponsor.get("party", ""),
+                            "role": sponsor.get("role", ""),
+                            "district": str(sponsor.get("district", "")),
+                            "chamber": "House" if sponsor.get("role") == "Rep" else "Senate",
+                        }
+
+                # Committee
+                committee_raw = bill.get("committee", {})
+                if isinstance(committee_raw, list):
+                    committee = committee_raw[0] if committee_raw else {}
+                else:
+                    committee = committee_raw or {}
+                committee_name = committee.get("name", "").strip()
+                if committee_name:
+                    c.execute("""
+                        INSERT OR IGNORE INTO committees
+                            (bill_id, session_id, committee_name, chamber)
+                        VALUES (?, ?, ?, ?)
+                    """, (bill_id, session_id, committee_name, chamber))
+
+                # Similar bills
+                for sb in bill.get("sasts", []):
+                    # sasts = "same as/similar to" — LegiScan's cross-session bill links
+                    c.execute("""
+                        INSERT OR IGNORE INTO similar_bills
+                            (bill_id, similar_bill_id, similar_number, similar_title, similar_session)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        bill_id,
+                        sb.get("sast_bill_id", 0),
+                        sb.get("sast_bill_number", ""),
+                        sb.get("title", ""),
+                        sb.get("sast_type", "")
+                    ))
+
+            except Exception as e:
+                print(f"  Warning: could not parse bill {fname}: {e}")
+                continue
+
+        # ---- VOTES ----
+        # Each vote file contains one roll call with all member votes inside it
+        for fname in vote_files:
+            try:
+                with zf.open(fname) as f:
+                    payload = json.load(f)
+                rc = payload.get("roll_call", payload)
+                roll_call_id = rc.get("roll_call_id")
+                bill_id = rc.get("bill_id")
+                if not roll_call_id or not bill_id:
+                    continue
+
+                rc_chamber_id = rc.get("chamber_id", 0)
+                rc_chamber = "House" if rc_chamber_id == 1 else "Senate" if rc_chamber_id == 2 else rc.get("chamber", "")
+
+                c.execute("""
+                    INSERT OR REPLACE INTO votes
+                        (roll_call_id, bill_id, session_id, date, description,
+                         yea, nay, nv, passed, chamber)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    roll_call_id, bill_id, session_id,
+                    rc.get("date", ""),
+                    rc.get("desc", ""),
+                    rc.get("yea", 0),
+                    rc.get("nay", 0),
+                    rc.get("nv", 0) + rc.get("absent", 0),
+                    rc.get("passed", 0),
+                    rc_chamber
+                ))
+
+                # Individual member votes are inside the roll call file
+                for mv in rc.get("votes", []):
+                    pid = mv.get("people_id")
+                    c.execute("""
+                        INSERT OR IGNORE INTO member_votes
+                            (roll_call_id, people_id, session_id, vote_text)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        roll_call_id, pid, session_id,
+                        mv.get("vote_text", "")
+                    ))
+                    # Collect legislator info from vote records
+                    if pid and pid not in legislators_seen:
+                        legislators_seen[pid] = {
+                            "people_id": pid,
+                            "name": mv.get("name", ""),
+                            "party": mv.get("party", ""),
+                            "role": "",
+                            "district": "",
+                            "chamber": "",
+                        }
+
+            except Exception as e:
+                print(f"  Warning: could not parse vote file {fname}: {e}")
+                continue
+
+    # ---- LEGISLATORS ----
     for pid, person in legislators_seen.items():
-        role = person.get("role", "")
-        leg_chamber = "House" if role == "Rep" else "Senate" if role == "Sen" else ""
         currently_serving = 1 if pid in current_people_ids else 0
         c.execute("""
             INSERT OR REPLACE INTO legislators
@@ -261,19 +281,18 @@ def store_session_data(conn, session_id, session_name, year, special,
             pid, session_id,
             person.get("name", ""),
             person.get("party", ""),
-            role,
+            person.get("role", ""),
             person.get("district", ""),
-            leg_chamber,
+            person.get("chamber", ""),
             currently_serving
         ))
 
     conn.commit()
-    print(f"  Stored {len(bills)} bills and {len(legislators_seen)} legislators.")
+    print(f"  Stored {len(bill_files)} bills, {len(vote_files)} roll calls, {len(legislators_seen)} legislators.")
 
 def run_historical_backfill():
     print("=== Missouri Vote Tracker: Historical Backfill via Datasets ===")
     print(f"Downloading {len(ALL_SESSIONS)} session datasets.")
-    print("Much faster than individual API calls — should complete in 10-30 minutes.")
     print("Safe to stop and restart — completed sessions are skipped automatically.")
     print("=" * 60)
 
@@ -283,32 +302,26 @@ def run_historical_backfill():
 
     for session_id, session_name, year, special, access_key in ALL_SESSIONS:
         print(f"\n--- {session_name} ---")
-
         progress = get_progress(conn, session_id)
         if progress and progress["completed"] == 1:
             print(f"  Already complete, skipping.")
             continue
 
         try:
-            bills = download_and_parse_dataset(session_id, session_name, access_key)
-            if not bills:
-                print(f"  No bills found, skipping.")
+            zip_buffer = download_zip(session_id, session_name, access_key)
+            if not zip_buffer:
                 mark_session_complete(conn, session_id)
                 continue
 
             store_session_data(
                 conn, session_id, session_name, year, special,
-                bills, current_people_ids
+                zip_buffer, current_people_ids
             )
             mark_session_complete(conn, session_id)
-            print(f"  Session complete.")
-
-            # Small pause between sessions to be polite to the API
             time.sleep(2)
 
         except Exception as e:
             print(f"  ERROR on {session_name}: {e}")
-            print(f"  Will retry this session next time you run the script.")
             continue
 
     conn.close()
