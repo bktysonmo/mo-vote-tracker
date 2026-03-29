@@ -286,6 +286,22 @@ def search_bills(bill_number_query, title_query, chamber_filter,
         result = result[result["bill_id"].isin(matching)]
     return result.head(200)
 
+def get_last_updated():
+    try:
+        conn = get_current_db()
+        df = pd.read_sql_query("""
+            SELECT MAX(fetched_at) as last_updated
+            FROM bill_summaries
+        """, conn)
+        if not df.empty and df.iloc[0]["last_updated"]:
+            from datetime import datetime
+            ts = df.iloc[0]["last_updated"]
+            dt = datetime.fromisoformat(ts)
+            return dt.strftime("%B %d, %Y at %I:%M %p")
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+
 def find_similar_bills(bill_title, current_bill_id, current_session_name, limit=10):
     hconn = get_history_db()
     if hconn is None:
@@ -594,6 +610,9 @@ if "last_search" not in st.session_state:
 # ----------------------- PAGE ROUTING -----------------------
 
 page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup", "Historical Search"])
+st.sidebar.divider()
+st.sidebar.caption(f"🕐 Data last updated: {get_last_updated()}")
+st.sidebar.caption("Updated Mon/Fri evenings and Tue–Thu 3x daily during session")
 
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
