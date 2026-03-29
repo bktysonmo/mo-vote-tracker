@@ -2,18 +2,15 @@ name: Nightly Vote Update
 
 on:
   schedule:
-    # Monday and Friday - end of day only (11pm UTC = 6pm Central)
     - cron: '0 23 * * 1'
     - cron: '0 23 * * 5'
-    # Tuesday, Wednesday, Thursday - 3x per day
-    # 2pm UTC = 9am Central (morning)
     - cron: '0 14 * * 2,3,4'
-    # 7pm UTC = 2pm Central (midday)
     - cron: '0 19 * * 2,3,4'
-    # 11pm UTC = 6pm Central (end of day)
     - cron: '0 23 * * 2,3,4'
   workflow_dispatch:
-    # Allows manual trigger from GitHub Actions tab anytime
+
+permissions:
+  contents: write
 
 jobs:
   update-votes:
@@ -23,8 +20,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          # Need full git history to push back
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
