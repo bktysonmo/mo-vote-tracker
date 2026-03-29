@@ -10,29 +10,16 @@ API_KEY = os.getenv("LEGISCAN_API_KEY")
 BASE_URL = "https://api.legiscan.com/"
 MO_STATE = "MO"
 
-# LegiScan bill status codes mapped to human-readable labels
-STATUS_MAP = {
-    1: "Introduced",
-    2: "Engrossed",
-    3: "Enrolled",
-    4: "Passed",
-    5: "Vetoed",
-    6: "Failed",
-    7: "Override",
-    8: "Chaptered",
-    9: "Refer",
-    10: "Report Pass",
-    11: "Report DNP",
-    12: "Draft",
-}
-
 def legiscan_call(op, **params):
     response = requests.get(BASE_URL, params={
         "key": API_KEY,
         "op": op,
         **params
-    })
-    data = response.json()
+    }, timeout=30)
+    try:
+        data = response.json()
+    except Exception:
+        raise Exception(f"LegiScan returned non-JSON response for {op}")
     if data.get("status") == "ERROR":
         raise Exception(f"LegiScan API error on {op}: {data.get('alert', 'unknown error')}")
     return data
@@ -50,10 +37,29 @@ def get_current_session_id():
     print("Falling back to known session ID 2239")
     return 2239
 
+def get_stored_hashes(conn):
+    # Returns a dict of {bill_id: change_hash} for all bills we already have
+    # change_hash is a fingerprint LegiScan generates whenever a bill changes
+    # If the hash matches what we have stored, the bill hasn't changed — skip it
+    cursor = conn.cursor()
+    cursor.execute("SELECT bill_id, change_hash FROM bills WHERE change_hash IS NOT NULL")
+    return {row["bill_id"]: row["change_hash"] for row in cursor.fetchall()}
+
+def ensure_change_hash_column(conn):
+    # Add change_hash column to bills table if it doesn't exist yet
+    cursor = conn.cursor()
+    try:
+        cursor.execute("ALTER TABLE bills ADD COLUMN change_hash TEXT")
+        conn.commit()
+        print("Added change_hash column to bills table.")
+    except Exception:
+        pass  # Column already exists
+
 def fetch_and_store_legislators(session_id):
     print("Fetching legislators...")
     data = legiscan_call("getSessionPeople", id=session_id)
     people = data.get("sessionpeople", {}).get("people", [])
+
     conn = get_connection()
     cursor = conn.cursor()
     for person in people:
@@ -80,98 +86,105 @@ def fetch_and_store_votes(session_id):
     data = legiscan_call("getMasterList", id=session_id)
     masterlist = data.get("masterlist", {})
     bill_entries = [v for k, v in masterlist.items() if k != "0"]
-    print(f"Found {len(bill_entries)} bills. Fetching data for each...")
+    print(f"Found {len(bill_entries)} bills in session.")
 
     conn = get_connection()
+    ensure_change_hash_column(conn)
+    stored_hashes = get_stored_hashes(conn)
     cursor = conn.cursor()
+
+    new_count = 0
+    changed_count = 0
+    skipped_count = 0
+    error_count = 0
 
     for i, bill_summary in enumerate(bill_entries):
         bill_id = bill_summary.get("bill_id")
         if not bill_id:
             continue
+
+        # Check if bill has changed since we last fetched it
+        incoming_hash = bill_summary.get("change_hash", "")
+        stored_hash = stored_hashes.get(bill_id)
+
+        if stored_hash and stored_hash == incoming_hash:
+            # Hash matches — bill hasn't changed, skip it entirely
+            skipped_count += 1
+            continue
+
+        # Hash is new or changed — fetch the full bill
+        is_new = stored_hash is None
+        if is_new:
+            new_count += 1
+        else:
+            changed_count += 1
+
         try:
             bill_data = legiscan_call("getBill", id=bill_id)
             bill = bill_data.get("bill", {})
 
-            # --- Derive status and originating chamber from bill data ---
-            status_id = bill.get("status", 0)
-            status_text = STATUS_MAP.get(status_id, "Unknown")
+            status_map = {1: "Introduced", 2: "Engrossed", 3: "Enrolled",
+                          4: "Passed", 5: "Vetoed", 6: "Failed"}
+            status_num = bill.get("status", 1)
+            status_text = status_map.get(status_num, "Introduced")
+            body_id = bill.get("body_id", 0)
+            chamber_text = "House" if body_id == 1 else "Senate" if body_id == 2 else ""
 
-            bill_number = bill.get("bill_number", "")
-            # Bill numbers start with H (House) or S (Senate)
-            if bill_number.startswith("H"):
-                bill_chamber = "House"
-            elif bill_number.startswith("S"):
-                bill_chamber = "Senate"
-            else:
-                bill_chamber = ""
-
-            # --- Store bill ---
             cursor.execute("""
                 INSERT OR REPLACE INTO bills
-                    (bill_id, bill_number, title, session, url, status, chamber)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (bill_id, bill_number, title, session, url, status, chamber, change_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bill.get("bill_id"),
-                bill_number,
+                bill.get("bill_number", ""),
                 bill.get("title", ""),
                 bill.get("session", {}).get("session_name", ""),
                 bill.get("state_link", ""),
                 status_text,
-                bill_chamber
+                chamber_text,
+                incoming_hash
             ))
 
-            # --- Store sponsors ---
+            # Store sponsors
             for sponsor in bill.get("sponsors", []):
-                people_id = sponsor.get("people_id")
-                if not people_id:
-                    continue
-                # sponsor_type: 0 = primary, 1 = co-sponsor
-                sponsor_type = "Primary" if sponsor.get("sponsor_type_id", 1) == 0 else "Co-Sponsor"
+                stype = "Primary" if sponsor.get("sponsor_type_id") == 1 else "Co-Sponsor"
                 cursor.execute("""
                     INSERT OR IGNORE INTO sponsors
-                        (bill_id, people_id, name, sponsor_type)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    bill.get("bill_id"),
-                    people_id,
-                    sponsor.get("name", ""),
-                    sponsor_type
-                ))
+                        (bill_id, name, sponsor_type)
+                    VALUES (?, ?, ?)
+                """, (bill.get("bill_id"), sponsor.get("name", ""), stype))
 
-            # --- Store committee referrals ---
+            # Store committee
             committee_raw = bill.get("committee", {})
-            # LegiScan sometimes returns a list, sometimes a single object
             if isinstance(committee_raw, list):
                 committee = committee_raw[0] if committee_raw else {}
             else:
-                committee = committee_raw
+                committee = committee_raw or {}
             committee_name = committee.get("name", "").strip()
             if committee_name:
-                # Derive committee chamber from committee name or bill chamber
-                if "Senate" in committee_name:
-                    committee_chamber = "Senate"
-                elif "House" in committee_name:
-                    committee_chamber = "House"
-                else:
-                    committee_chamber = bill_chamber
                 cursor.execute("""
                     INSERT OR IGNORE INTO committees
                         (bill_id, committee_name, chamber)
                     VALUES (?, ?, ?)
-                """, (
-                    bill.get("bill_id"),
-                    committee_name,
-                    committee_chamber
-                ))
+                """, (bill.get("bill_id"), committee_name, chamber_text))
 
-            # --- Store roll call votes ---
+            # Store roll calls and member votes
             for vote_summary in bill.get("votes", []):
                 roll_call_id = vote_summary.get("roll_call_id")
                 if not roll_call_id:
                     continue
+
+                # Check if we already have this roll call
+                cursor.execute(
+                    "SELECT 1 FROM votes WHERE roll_call_id = ?", (roll_call_id,)
+                )
+                if cursor.fetchone():
+                    # Already have this roll call — skip the getRollCall query
+                    continue
+
                 rc_data = legiscan_call("getRollCall", id=roll_call_id)
                 rc = rc_data.get("roll_call", {})
+
                 cursor.execute("""
                     INSERT OR REPLACE INTO votes
                         (roll_call_id, bill_id, date, description, yea, nay, nv, passed, chamber)
@@ -187,6 +200,7 @@ def fetch_and_store_votes(session_id):
                     rc.get("passed", 0),
                     rc.get("chamber", "")
                 ))
+
                 for member_vote in rc.get("votes", []):
                     cursor.execute("""
                         INSERT OR IGNORE INTO member_votes
@@ -197,20 +211,27 @@ def fetch_and_store_votes(session_id):
                         member_vote.get("people_id"),
                         member_vote.get("vote_text", "")
                     ))
+
                 time.sleep(0.3)
 
             conn.commit()
-            time.sleep(0.2)
+            time.sleep(0.1)
 
-            if i % 10 == 0:
-                print(f"  Progress: {i}/{len(bill_entries)} bills...")
+            if (i + 1) % 50 == 0:
+                print(f"  Progress: {i+1}/{len(bill_entries)} | New: {new_count} | Changed: {changed_count} | Skipped: {skipped_count}")
 
         except Exception as e:
             print(f"  Skipping bill {bill_id}: {e}")
+            error_count += 1
             continue
 
     conn.close()
-    print("Done fetching votes.")
+    print(f"\nFetch complete.")
+    print(f"  New bills: {new_count}")
+    print(f"  Changed bills: {changed_count}")
+    print(f"  Unchanged (skipped): {skipped_count}")
+    print(f"  Errors: {error_count}")
+    print(f"  API queries used this run: ~{new_count + changed_count + (new_count + changed_count)}")
 
 def run_full_fetch():
     print("=== Missouri Vote Tracker: Starting data fetch ===")
