@@ -612,12 +612,10 @@ if "last_search" not in st.session_state:
 page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup", "Historical Search"])
 st.sidebar.divider()
 st.sidebar.caption(f"🕐 Data last updated: {get_last_updated()}")
-st.sidebar.caption("Updated Mon/Fri evenings and Tue–Thu 3x daily during session")
+st.sidebar.caption("Automatically Updated at EOD")
 st.sidebar.divider()
 st.sidebar.markdown("**Questions or Requests?**")
-st.sidebar.markdown("Contact Kate at")
-st.sidebar.markdown("📞 (417) 680-4234")
-st.sidebar.markdown("✉️ ktkqw@missouri.edu")
+st.sidebar.markdown("Contact me at ktkqw@missouri.edu or (417) 6804234")
 
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
