@@ -613,6 +613,11 @@ page = st.sidebar.radio("Navigate", ["Legislator Lookup", "Bill Lookup", "Histor
 st.sidebar.divider()
 st.sidebar.caption(f"🕐 Data last updated: {get_last_updated()}")
 st.sidebar.caption("Updated Mon/Fri evenings and Tue–Thu 3x daily during session")
+st.sidebar.divider()
+st.sidebar.markdown("**Questions or Requests?**")
+st.sidebar.markdown("Contact Kate at")
+st.sidebar.markdown("📞 (417) 680-4234")
+st.sidebar.markdown("✉️ ktkqw@missouri.edu")
 
 # ----------------------- LEGISLATOR LOOKUP -----------------------
 
