@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+from database import get_connection
 from pdf_reports import (
     generate_legislator_voting_record,
     generate_legislator_party_line_report,
