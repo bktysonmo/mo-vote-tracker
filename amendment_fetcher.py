@@ -20,8 +20,6 @@ HEADERS = {
 }
 
 def get_senate_bill_map():
-    # Reuse the same map we build in summary_fetcher
-    # Maps "SB 835" -> "417"
     print("  Building Senate bill ID map...")
     url = f"https://www.senate.mo.gov/BillTracking/Bills/BillList?year={CURRENT_YEAR}&session=R"
     try:
@@ -40,7 +38,6 @@ def get_senate_bill_map():
         return {}
 
 def fetch_senate_amendments(bill_number, bill_id_str):
-    # Scrape the Senate bill page for amendments
     url = f"https://www.senate.mo.gov/BillTracking/Bills/BillInformation?year={CURRENT_YEAR}&billid={bill_id_str}"
     try:
         r = requests.get(url, timeout=10, headers=HEADERS)
@@ -49,8 +46,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
         soup = BeautifulSoup(r.text, "html.parser")
 
         amendments = []
-        # Find the Amendments section
-        # Amendments are listed as links with amendmentId in the URL
         for link in soup.find_all("a", href=True):
             href = link["href"]
             if "handler=AmendmentPdf" not in href:
@@ -63,7 +58,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
             amendment_id = amendment_id_match.group(1)
             pdf_url = f"https://www.senate.mo.gov/BillTracking/Bills/BillInformation?handler=AmendmentPdf&year={CURRENT_YEAR}&amendmentId={amendment_id}"
 
-            # Link text contains "CODE - NAME\nSTATUS"
             link_text = link.get_text(separator="\n", strip=True)
             lines = [l.strip() for l in link_text.split("\n") if l.strip()]
 
@@ -72,7 +66,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
             status = ""
 
             if lines:
-                # First line is usually "CODE - NAME"
                 first = lines[0]
                 if " - " in first:
                     parts = first.split(" - ", 1)
@@ -81,9 +74,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
                 else:
                     amendment_code = first
 
-            # Look for status in surrounding text or title attribute
-            title = link.get("title", "")
-            # Status is often in the link text after the code/name
             full_text_lower = link_text.lower()
             if "adopted" in full_text_lower:
                 status = "Adopted"
@@ -94,7 +84,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
             else:
                 status = "Pending"
 
-            # Also check parent element for status
             parent = link.parent
             if parent:
                 parent_text = parent.get_text(separator=" ", strip=True)
@@ -120,7 +109,6 @@ def fetch_senate_amendments(bill_number, bill_id_str):
         return []
 
 def fetch_house_amendments(bill_number):
-    # Scrape the House amendments page
     bill_clean = bill_number.replace(" ", "")
     url = f"https://www.house.mo.gov/amendments.aspx?bill={bill_clean}&year={CURRENT_YEAR}&code=R"
     try:
@@ -131,13 +119,12 @@ def fetch_house_amendments(bill_number):
         soup = BeautifulSoup(r.text, "html.parser")
         amendments = []
 
-        # Find the amendments table
         table = soup.find("table")
         if not table:
             return []
 
         rows = table.find_all("tr")
-        for row in rows[1:]:  # Skip header row
+        for row in rows[1:]:
             cells = row.find_all("td")
             if len(cells) < 3:
                 continue
@@ -147,7 +134,6 @@ def fetch_house_amendments(bill_number):
             sponsor_cell = cells[2]
             floor_cell = cells[3] if len(cells) > 3 else None
 
-            # Amendment code is the link text in cell 1
             amendment_link = amendment_cell.find("a")
             if not amendment_link:
                 continue
@@ -156,7 +142,6 @@ def fetch_house_amendments(bill_number):
             sponsor = sponsor_cell.get_text(strip=True)
             floor_number = floor_cell.get_text(strip=True) if floor_cell else ""
 
-            # Build PDF URL from amendment code
             pdf_url = f"https://documents.house.mo.gov/billtracking/bills{CURRENT_ASSEMBLY}/amendpdf/{amendment_code}.pdf"
 
             amendments.append({
@@ -174,7 +159,6 @@ def fetch_house_amendments(bill_number):
         return []
 
 def fetch_amendment_text(pdf_url):
-    # Download and extract text from amendment PDF
     try:
         import pdfplumber
         r = requests.get(pdf_url, timeout=15, headers=HEADERS)
@@ -217,7 +201,7 @@ def store_amendment(conn, bill_id, bill_number, chamber, amendment):
     ))
     conn.commit()
 
-def run_amendment_fetch():
+def run_amendment_fetch(senate_only=False):
     print("=== Missouri Vote Tracker: Amendment Fetcher ===")
 
     try:
@@ -230,14 +214,18 @@ def run_amendment_fetch():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Get all current session bills
     cursor.execute("""
         SELECT bill_id, bill_number, chamber
         FROM bills
         ORDER BY chamber, bill_number
     """)
     all_bills = cursor.fetchall()
-    print(f"Processing {len(all_bills)} bills for amendments.")
+
+    if senate_only:
+        all_bills = [b for b in all_bills if b["chamber"] == "Senate"]
+        print(f"Senate-only mode: {len(all_bills)} Senate bills.")
+    else:
+        print(f"Processing {len(all_bills)} bills for amendments.")
 
     senate_map = get_senate_bill_map()
 
@@ -258,7 +246,9 @@ def run_amendment_fetch():
             if amendments:
                 house_count += 1
         elif chamber == "Senate" or bill_number.upper().startswith("SB") or bill_number.upper().startswith("SJR"):
-            bill_id_str = senate_map.get(bill_number)
+            # Normalize bill number: "SB885" -> "SB 885" to match senate map keys
+            normalized = re.sub(r'^(S[BJR]+)(\d)', r'\1 \2', bill_number)
+            bill_id_str = senate_map.get(normalized) or senate_map.get(bill_number)
             if bill_id_str:
                 amendments = fetch_senate_amendments(bill_number, bill_id_str)
                 if amendments:
@@ -266,7 +256,6 @@ def run_amendment_fetch():
 
         for amendment in amendments:
             amendment_count += 1
-            # Only fetch PDF if we don't already have the text
             if not already_fetched(conn, bill_number, amendment["amendment_code"]):
                 text = fetch_amendment_text(amendment["pdf_url"])
                 amendment["full_text"] = text
@@ -278,7 +267,6 @@ def run_amendment_fetch():
 
             store_amendment(conn, bill_id, bill_number, chamber, amendment)
 
-        # Small pause between bills
         time.sleep(0.2)
 
         if (i + 1) % 100 == 0:
@@ -292,4 +280,4 @@ def run_amendment_fetch():
     print(f"Amendment PDFs fetched: {pdf_count}")
 
 if __name__ == "__main__":
-    run_amendment_fetch()
+    run_amendment_fetch(senate_only=True)
