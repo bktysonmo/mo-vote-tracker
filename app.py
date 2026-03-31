@@ -19,6 +19,25 @@ st.caption("Tracking votes in the Missouri House and Senate")
 
 # ----------------------- DATA LOADING -----------------------
 
+def get_bill_amendments(bill_id):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT
+            amendment_code,
+            amendment_name,
+            sponsor,
+            floor_number,
+            status,
+            full_text,
+            pdf_url,
+            chamber
+        FROM amendments
+        WHERE bill_id = ?
+        ORDER BY chamber, floor_number, amendment_code
+    """, conn, params=(bill_id,))
+    conn.close()
+    return df
+
 @st.cache_resource
 def load_all_data():
     conn = sqlite3.connect("mo_votes.db", check_same_thread=False)
@@ -447,14 +466,17 @@ def render_similar_bill_detail(sim_bill_id, sim_bill_number, sim_title, sim_sess
 # ----------------------- BILL DETAIL RENDERER -----------------------
 
 def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
+ 
+    # --- Top metadata ---
     col1, col2, col3 = st.columns(3)
     col1.metric("Chamber", bill_row["chamber"] or "—")
     col2.metric("Status", bill_row["status"] or "—")
     col3.metric("Session", bill_row["session"] or "—")
-
+ 
     if bill_row["url"]:
         st.caption(f"[View on LegiScan]({bill_row['url']})")
-
+ 
+    # --- Sponsors ---
     sp = get_bill_sponsors(bill_id)
     if not sp.empty:
         primary = sp[sp["sponsor_type"] == "Primary"]["name"].tolist()
@@ -463,12 +485,13 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             st.markdown(f"**Primary Sponsor:** {', '.join(primary)}")
         if cospon:
             st.markdown(f"**Co-Sponsors:** {', '.join(cospon)}")
-
+ 
+    # --- Committee ---
     cm = get_bill_committees(bill_id)
     if not cm.empty:
         st.markdown(f"**Committee:** {', '.join(cm['committee_name'].tolist())}")
-
-    # Official bill summary
+ 
+    # --- Official bill summary ---
     summary_row = get_bill_summary_text(bill_id)
     if summary_row is not None:
         with st.expander("📝 Official Bill Summary"):
@@ -476,8 +499,8 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             source = "MO House PDF" if version in ["I", "S", "T", "C"] else "MO Senate website"
             st.caption(f"Source: {source} (version {version})")
             st.write(summary_row["summary_text"])
-
-    # Similar bills
+ 
+    # --- Similar bills ---
     with st.expander("📋 Similar Bills in Other Sessions"):
         official = get_official_similar_bills(bill_id)
         if not official.empty:
@@ -486,7 +509,7 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
                 rel = row["relationship"].replace("is ", "").title()
                 st.markdown(f"- **{row['similar_number']}** ({row['similar_year']}) — {rel}")
             st.divider()
-
+ 
         with st.spinner("Searching historical sessions..."):
             similar = find_similar_bills(
                 bill_title, bill_id,
@@ -501,7 +524,7 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
                 "bill_number": "Bill", "title": "Title",
                 "session_name": "Session", "status": "Status", "score": "Relevance"
             }).reset_index(drop=True)
-
+ 
             sim_sel = st.dataframe(
                 sim_display, use_container_width=True,
                 on_select="rerun", selection_mode="single-row",
@@ -520,14 +543,77 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
                 )
         elif official.empty:
             st.info("No similar bills found.")
-
+ 
     st.divider()
-
+ 
+    # --- Amendments ---
+    amendments_df = get_bill_amendments(bill_id)
+    if not amendments_df.empty:
+        st.subheader(f"Amendments ({len(amendments_df)})")
+ 
+        # Status summary counts
+        status_counts = amendments_df["status"].value_counts()
+        stat_cols = st.columns(min(len(status_counts), 4))
+        for i, (status, count) in enumerate(status_counts.items()):
+            stat_cols[i].metric(status or "Pending", count)
+ 
+        st.markdown(" ")
+ 
+        for _, amend in amendments_df.iterrows():
+            code = amend["amendment_code"] or "—"
+            name = amend["amendment_name"] or ""
+            sponsor = amend["sponsor"] or ""
+            floor = amend["floor_number"] or ""
+            status = amend["status"] or "Pending"
+            full_text = amend["full_text"] or ""
+            pdf_url = amend["pdf_url"] or ""
+ 
+            # Build expander label
+            label_parts = [code]
+            if name and name != floor:
+                label_parts.append(name)
+            if floor and floor not in label_parts:
+                label_parts.append(floor)
+            label = " · ".join(label_parts)
+ 
+            # Status badge
+            if "adopted" in status.lower():
+                badge = f"✅ {status}"
+            elif "failed" in status.lower():
+                badge = f"❌ {status}"
+            elif "withdrawn" in status.lower():
+                badge = f"↩️ {status}"
+            else:
+                badge = f"⏳ {status}"
+ 
+            with st.expander(f"{label} — {badge}"):
+                meta_cols = st.columns(3)
+                meta_cols[0].markdown(f"**Sponsor:** {sponsor or '—'}")
+                meta_cols[1].markdown(f"**Floor:** {floor or '—'}")
+                meta_cols[2].markdown(f"**Status:** {status}")
+ 
+                if pdf_url:
+                    st.markdown(f"[📄 View PDF]({pdf_url})")
+ 
+                if full_text:
+                    st.markdown("**Amendment Text:**")
+                    if len(full_text) > 1000:
+                        st.text(full_text[:1000] + "...")
+                        with st.expander("Show full text"):
+                            st.text(full_text)
+                    else:
+                        st.text(full_text)
+                else:
+                    st.caption("No text available for this amendment.")
+ 
+        st.divider()
+ 
+    # --- Roll call votes ---
     roll_calls = get_bill_votes(bill_id)
     if roll_calls.empty:
         st.info("No roll call votes recorded for this bill yet.")
         return
-
+ 
     rc_list = []
     for _, rc in roll_calls.iterrows():
         detail = get_roll_call_detail(int(rc["roll_call_id"]))
@@ -542,7 +628,9 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             "party_summary_df": party_summary,
             "detail_df": detail
         })
-
+ 
+    st.subheader(f"Roll Call Votes ({len(rc_list)})")
+ 
     for rc in rc_list:
         result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
         with st.expander(f"{rc['date']} — {rc['description']} ({result_label})"):
@@ -563,7 +651,8 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
                     }),
                     use_container_width=True
                 )
-
+ 
+    # --- PDF downloads ---
     st.subheader("Download Reports")
     c1, c2, c3 = st.columns(3)
     with c1:

@@ -82,11 +82,29 @@ def setup_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS committees (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            bill_id         INTEGER,  -- Which bill
+bill_id         INTEGER,  -- Which bill
             committee_name  TEXT,     -- e.g. "Ways and Means"
             chamber         TEXT,     -- "House" or "Senate"
             FOREIGN KEY (bill_id) REFERENCES bills(bill_id),
             UNIQUE(bill_id, committee_name)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS amendments (
+            amendment_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id         INTEGER,
+            bill_number     TEXT,
+            chamber         TEXT,
+            amendment_code  TEXT,
+            amendment_name  TEXT,
+            sponsor         TEXT,
+            floor_number    TEXT,
+            status          TEXT,
+            full_text       TEXT,
+            pdf_url         TEXT,
+            fetched_at      TEXT,
+            UNIQUE(bill_number, amendment_code)
         )
     """)
 
