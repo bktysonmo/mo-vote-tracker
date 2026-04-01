@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import re
 from database import get_connection
 from pdf_reports import (
     generate_legislator_voting_record,
@@ -148,6 +149,196 @@ def get_bill_summary_text(bill_id):
         return df.iloc[0] if not df.empty else None
     except Exception:
         return None
+
+# ── 1. RESOLVE JOURNAL NAME → LEGISLATOR ─────────────────────────────────────
+ 
+def resolve_journal_member(raw_name, legislators_df):
+    """
+    Journal stores names like 'Jones 12' or 'Walsh Moore' (no district).
+    Strategy:
+      1. If raw_name ends in a number, split into (surname, district) and
+         match on both.
+      2. Otherwise do a loose surname match — last word of raw_name vs
+         last word of full legislator name.
+    Returns a dict with name/party/chamber/district, or best-effort fallback.
+    """
+    parts = raw_name.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        surname, district = parts[0].strip(), parts[1]
+        match = legislators_df[
+            (legislators_df["name"].str.contains(surname, case=False, na=False)) &
+            (legislators_df["district"] == district)
+        ]
+        if not match.empty:
+            row = match.iloc[0]
+            return {
+                "name":     row["name"],
+                "party":    row["party"],
+                "chamber":  row["chamber"],
+                "district": row["district"],
+                "matched":  True,
+            }
+    else:
+        # No district number — match on last word of name
+        surname = parts[-1].strip()
+        match = legislators_df[
+            legislators_df["name"].str.split().str[-1].str.lower() == surname.lower()
+        ]
+        if len(match) == 1:          # only use if unambiguous
+            row = match.iloc[0]
+            return {
+                "name":     row["name"],
+                "party":    row["party"],
+                "chamber":  row["chamber"],
+                "district": row["district"],
+                "matched":  True,
+            }
+ 
+    # Could not resolve — return raw name, district inferred if present
+    district_guess = parts[1] if len(parts) == 2 and parts[1].isdigit() else ""
+    return {
+        "name":     raw_name,
+        "party":    "Unknown",
+        "chamber":  "",
+        "district": district_guess,
+        "matched":  False,
+    }
+ 
+ 
+# ── 2. FETCH JOURNAL VOTES FOR A BILL ────────────────────────────────────────
+ 
+def get_journal_votes_for_bill(bill_number):
+    """
+    Return all journal roll calls for a bill number.
+    bill_number can be exact ('HB 1234') or a component ('HBs 1234 & 5678').
+    We match loosely so combined-bill entries are found.
+    """
+    conn = get_current_db()
+    try:
+        # Grab the core number(s) from the bill_number string
+        numbers = re.findall(r"\d+", bill_number)
+        if not numbers:
+            return pd.DataFrame()
+ 
+        # Build a WHERE clause that matches if ANY of the numbers appear
+        clauses = " OR ".join(["bill_number LIKE ?" for _ in numbers])
+        params  = [f"%{n}%" for n in numbers]
+ 
+        df = pd.read_sql_query(f"""
+            SELECT journal_roll_call_id, journal_num, journal_date,
+                   bill_number, description, yea, nay, present, absent, passed
+            FROM journal_votes
+            WHERE {clauses}
+            ORDER BY journal_date, journal_num
+        """, conn, params=params)
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+ 
+ 
+# ── 3. FETCH MEMBER DETAIL FOR A JOURNAL ROLL CALL ───────────────────────────
+ 
+def get_journal_roll_call_detail(journal_roll_call_id):
+    """
+    Returns a DataFrame with columns:
+      name, party, chamber, district, vote_text
+    matching the shape of get_roll_call_detail() so existing rendering
+    code (calculate_party_line, etc.) works unchanged.
+    """
+    conn = get_current_db()
+    try:
+        mv = pd.read_sql_query("""
+            SELECT member_name, vote_text
+            FROM journal_member_votes
+            WHERE journal_roll_call_id = ?
+        """, conn, params=(journal_roll_call_id,))
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+ 
+    if mv.empty:
+        return pd.DataFrame()
+ 
+    rows = []
+    for _, row in mv.iterrows():
+        info = resolve_journal_member(row["member_name"], legislators)
+        rows.append({
+            "name":      info["name"],
+            "party":     info["party"],
+            "chamber":   info["chamber"],
+            "district":  info["district"],
+            "vote_text": row["vote_text"],
+        })
+ 
+    return pd.DataFrame(rows).sort_values(["party", "name"])
+ 
+ 
+# ── 4. MERGE LEGISCAN + JOURNAL ROLL CALLS ───────────────────────────────────
+ 
+def get_merged_roll_calls(bill_id, bill_number):
+    """
+    Returns a unified list of roll-call dicts ready for render_bill_detail().
+    Each dict has:
+      date, description, passed, yea, nay, nv,
+      party_summary_df, detail_df, source ('LegiScan' | 'Journal')
+ 
+    De-duplication: if a journal entry's date + passed count closely matches
+    a LegiScan entry we already have, we prefer the LegiScan version (richer
+    people_id linkage) and skip the journal duplicate.
+    """
+    import re
+ 
+    # ── LegiScan roll calls (existing path) ──────────────────────────────────
+    ls_votes = get_bill_votes(bill_id)          # existing function
+    ls_list  = []
+    ls_keys  = set()                            # (date, yea) for dedup
+ 
+    for _, rc in ls_votes.iterrows():
+        detail        = get_roll_call_detail(int(rc["roll_call_id"]))
+        party_summary = calculate_party_line(detail) if not detail.empty else pd.DataFrame()
+        ls_list.append({
+            "date":             rc["date"],
+            "description":      rc["description"],
+            "passed":           rc["passed"],
+            "yea":              rc["yea"],
+            "nay":              rc["nay"],
+            "nv":               rc["nv"],
+            "party_summary_df": party_summary,
+            "detail_df":        detail,
+            "source":           "LegiScan",
+        })
+        ls_keys.add((rc["date"], int(rc["yea"])))
+ 
+    # ── Journal roll calls ────────────────────────────────────────────────────
+    jrn_votes = get_journal_votes_for_bill(bill_number)
+    jrn_list  = []
+ 
+    for _, rc in jrn_votes.iterrows():
+        key = (rc["journal_date"], int(rc["yea"]))
+        if key in ls_keys:
+            continue                            # duplicate — LegiScan wins
+ 
+        detail        = get_journal_roll_call_detail(rc["journal_roll_call_id"])
+        party_summary = calculate_party_line(detail) if not detail.empty else pd.DataFrame()
+        nv_count      = int(rc["present"]) + int(rc["absent"])
+        jrn_list.append({
+            "date":             rc["journal_date"],
+            "description":      rc["description"] or "Floor vote",
+            "passed":           int(rc["passed"]),
+            "yea":              int(rc["yea"]),
+            "nay":              int(rc["nay"]),
+            "nv":               nv_count,
+            "party_summary_df": party_summary,
+            "detail_df":        detail,
+            "source":           "Journal",
+        })
+ 
+    # ── Merge and sort by date ────────────────────────────────────────────────
+    merged = sorted(ls_list + jrn_list, key=lambda x: x["date"], reverse=True)
+    return merged
 
 # ----------------------- HISTORY DB QUERIES -----------------------
 
@@ -309,19 +500,32 @@ def get_last_updated():
     try:
         conn = get_current_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT value FROM meta WHERE key = 'votes_last_updated'")
-        row = cursor.fetchone()
-        if row:
-            from datetime import datetime, timezone
-            import zoneinfo
-            ts = row[0].replace("Z", "+00:00")
+ 
+        timestamps = []
+        for key in ("votes_last_updated", "journal_last_updated"):
+            cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                timestamps.append(row[0])
+ 
+        if not timestamps:
+            return "Unknown"
+ 
+        from datetime import datetime, timezone
+        import zoneinfo
+ 
+        # Pick the most recent timestamp across both sources
+        def parse_ts(ts):
+            ts = ts.replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            central = zoneinfo.ZoneInfo("America/Chicago")
-            dt_central = dt.astimezone(central)
-            return dt_central.strftime("%B %d, %Y at %I:%M %p CT")
-        return "Unknown"
+            return dt
+ 
+        latest = max(timestamps, key=parse_ts)
+        dt_central = parse_ts(latest).astimezone(zoneinfo.ZoneInfo("America/Chicago"))
+        return dt_central.strftime("%B %d, %Y at %I:%M %p CT")
+ 
     except Exception:
         return "Unknown"
 
@@ -612,32 +816,19 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
  
         st.divider()
  
-    # --- Roll call votes ---
-    roll_calls = get_bill_votes(bill_id)
-    if roll_calls.empty:
+        # --- Roll call votes (LegiScan + Journal merged) ---
+    rc_list = get_merged_roll_calls(bill_id, bill_number)
+ 
+    if not rc_list:
         st.info("No roll call votes recorded for this bill yet.")
         return
- 
-    rc_list = []
-    for _, rc in roll_calls.iterrows():
-        detail = get_roll_call_detail(int(rc["roll_call_id"]))
-        party_summary = calculate_party_line(detail) if not detail.empty else pd.DataFrame()
-        rc_list.append({
-            "date": rc["date"],
-            "description": rc["description"],
-            "passed": rc["passed"],
-            "yea": rc["yea"],
-            "nay": rc["nay"],
-            "nv": rc["nv"],
-            "party_summary_df": party_summary,
-            "detail_df": detail
-        })
  
     st.subheader(f"Roll Call Votes ({len(rc_list)})")
  
     for rc in rc_list:
         result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
-        with st.expander(f"{rc['date']} — {rc['description']} ({result_label})"):
+        source_badge = "📡 LegiScan" if rc["source"] == "LegiScan" else "📄 House Journal"
+        with st.expander(f"{rc['date']} — {rc['description']} ({result_label})  {source_badge}"):
             c1, c2, c3 = st.columns(3)
             c1.metric("Yea", rc["yea"])
             c2.metric("Nay", rc["nay"])
