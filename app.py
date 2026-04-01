@@ -150,6 +150,51 @@ def get_bill_summary_text(bill_id):
     except Exception:
         return None
 
+def get_chapters_for_bill(bill_id):
+    """Return list of RSMo chapter strings for a bill, e.g. ['167', '452']"""
+    try:
+        conn = sqlite3.connect("mo_votes.db")
+        conn.row_factory = sqlite3.Row
+        df = pd.read_sql_query("""
+            SELECT chapter FROM bill_chapters
+            WHERE bill_id = ?
+            ORDER BY CAST(chapter AS INTEGER)
+        """, conn, params=(bill_id,))
+        conn.close()
+        return df["chapter"].tolist() if not df.empty else []
+    except Exception as e:
+        st.write(f"DEBUG chapter error: {e}")  # temporary
+        return []
+  
+def get_bills_sharing_chapter(bill_id, bill_number, chapters):
+    if not chapters:
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect("mo_votes.db")
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" * len(chapters))
+        df = pd.read_sql_query(f"""
+            SELECT
+                b.bill_id,
+                b.bill_number,
+                b.title,
+                b.status,
+                b.chamber,
+                GROUP_CONCAT(bc.chapter) AS shared_chapters
+            FROM bill_chapters bc
+            JOIN bills b ON bc.bill_id = b.bill_id
+            WHERE bc.chapter IN ({placeholders})
+              AND bc.bill_id != ?
+            GROUP BY b.bill_id
+            ORDER BY COUNT(bc.chapter) DESC, b.bill_number
+            LIMIT 50
+        """, conn, params=chapters + [bill_id])
+        conn.close()
+        return df
+    except Exception as e:
+        st.write(f"DEBUG sharing error: {e}")
+        return pd.DataFrame()
+
 # ── 1. RESOLVE JOURNAL NAME → LEGISLATOR ─────────────────────────────────────
  
 def resolve_journal_member(raw_name, legislators_df):
@@ -673,11 +718,14 @@ def render_similar_bill_detail(sim_bill_id, sim_bill_number, sim_title, sim_sess
 
 # ----------------------- BILL DETAIL RENDERER -----------------------
 
-def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
- 
+def render_bill_detail(bill_id, bill_number, bill_title, bill_row, depth=0): 
     # --- Top metadata ---
     col1, col2, col3 = st.columns(3)
-    col1.metric("Chamber", bill_row["chamber"] or "—")
+    chamber = bill_row["chamber"] or (
+        "House" if bill_number.startswith("H") else
+        "Senate" if bill_number.startswith("S") else "—"
+    )
+    col1.metric("Chamber", chamber)
     col2.metric("Status", bill_row["status"] or "—")
     col3.metric("Session", bill_row["session"] or "—")
  
@@ -699,6 +747,48 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
     if not cm.empty:
         st.markdown(f"**Committee:** {', '.join(cm['committee_name'].tolist())}")
  
+# --- RSMo Chapter Cross-Reference ---
+    chapters = get_chapters_for_bill(bill_id)
+    if chapters:
+        chapter_labels = ", ".join(f"Ch. {c}" for c in chapters)
+        st.markdown(f"**Opens RSMo:** {chapter_labels}")
+ 
+        with st.expander(f"📚 Bills Opening the Same RSMo Chapter(s)"):
+            related = get_bills_sharing_chapter(bill_id, bill_number, chapters)
+            if related.empty:
+                st.info("No other bills found opening the same chapters.")
+            else:
+                st.caption(
+                    f"{len(related)} bill(s) touch the same RSMo chapter(s) as {bill_number}"
+                )
+                display = related[[
+                    "bill_number", "title", "chamber", "status", "shared_chapters"
+                ]].rename(columns={
+                    "bill_number":     "Bill",
+                    "title":           "Title",
+                    "chamber":         "Chamber",
+                    "status":          "Status",
+                    "shared_chapters": "Shared Chapters"
+                }).reset_index(drop=True)
+ 
+                sel = st.dataframe(
+                    display, use_container_width=True,
+                    on_select="rerun", selection_mode="single-row",
+                    key=f"chapter_xref_{bill_id}"
+                )
+                if sel.selection.rows:
+                    xref_row = related.iloc[sel.selection.rows[0]]
+                    st.divider()
+                    st.subheader(f"📄 {xref_row['bill_number']} — {xref_row['title']}")
+                    xref_bill = bills[bills["bill_id"] == xref_row["bill_id"]]
+                    if not xref_bill.empty:
+                        render_bill_detail(
+                            int(xref_row["bill_id"]),
+                            xref_row["bill_number"],
+                            xref_row["title"],
+                            xref_bill.iloc[0]
+                        )
+
     # --- Official bill summary ---
     summary_row = get_bill_summary_text(bill_id)
     if summary_row is not None:
@@ -716,7 +806,8 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
             for _, row in official.iterrows():
                 rel = row["relationship"].replace("is ", "").title()
                 st.markdown(f"- **{row['similar_number']}** ({row['similar_year']}) — {rel}")
-            st.divider()
+            if not official.empty:
+                st.divider()
  
         with st.spinner("Searching historical sessions..."):
             similar = find_similar_bills(
@@ -813,9 +904,16 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row):
                         st.text(full_text)
                 else:
                     st.caption("No text available for this amendment.")
- 
-        st.divider()
- 
+
+    # --- Official bill summary ---
+    summary_row = get_bill_summary_text(bill_id)
+    if summary_row is not None:
+        with st.expander("📝 Official Bill Summary"):
+            version = summary_row["source_version"]
+            source = "MO House PDF" if version in ["I", "S", "T", "C"] else "MO Senate website"
+            st.caption(f"Source: {source} (version {version})")
+            st.write(summary_row["summary_text"])
+
         # --- Roll call votes (LegiScan + Journal merged) ---
     rc_list = get_merged_roll_calls(bill_id, bill_number)
  
@@ -1016,6 +1114,13 @@ elif page == "Bill Lookup":
     if results.empty:
         st.info("No bills match your search. Try adjusting your filters.")
     else:
+        results = results.copy()
+        results["chamber"] = results.apply(
+            lambda r: r["chamber"] if r["chamber"] else (
+                "House" if r["bill_number"].startswith("H") else
+                "Senate" if r["bill_number"].startswith("S") else "—"
+            ), axis=1
+        )
         display_results = results[["bill_number", "title", "chamber", "status", "session"]].rename(columns={
             "bill_number": "Bill", "title": "Title",
             "chamber": "Chamber", "status": "Status", "session": "Session"

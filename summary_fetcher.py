@@ -91,6 +91,28 @@ def extract_similar_bills(text, bill_number):
             })
     return results
 
+CHAPTER_PATTERN = re.compile(
+    r'(?:'
+    r'chapters?\s+(\d{2,3})(?:\s*,\s*(\d{2,3}))*(?:\s+and\s+(\d{2,3}))?'  # "chapters 208 and 209" or "chapters 208, 209"
+    r'|section\s+(\d{2,3})\.\d+'
+    r'|\b(\d{2,3})(?:\.\d+)+\s*,?\s*RSMo'
+    r')',
+    re.IGNORECASE
+)
+
+def extract_chapters(text):
+    chapters = set()
+    # Handle "chapters X and Y" separately since it needs findall on the number list
+    for m in re.finditer(r'chapters?\s+([\d,\s]+(?:and\s+\d+)?)', text, re.IGNORECASE):
+        for ch in re.findall(r'\d{2,3}', m.group(1)):
+            chapters.add(ch.lstrip('0') or '0')
+    # Handle section X.Y and X.Y RSMo
+    for m in re.finditer(r'section\s+(\d{2,3})\.\d+|\b(\d{2,3})(?:\.\d+)+\s*,?\s*RSMo', text, re.IGNORECASE):
+        ch = m.group(1) or m.group(2)
+        if ch:
+            chapters.add(ch.lstrip('0') or '0')
+    return sorted(chapters)
+
 def fetch_house_summary(bill_number, assembly=CURRENT_ASSEMBLY):
     try:
         import pdfplumber
@@ -227,6 +249,27 @@ def run_summary_fetch():
                     """, (bill_id, bill_number, ref["similar_number"],
                           ref["similar_year"], ref["relationship"], source_version))
                     similar_count += 1
+                except Exception:
+                    pass
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS bill_chapters (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bill_id     INTEGER,
+                    bill_number TEXT,
+                    chapter     TEXT,
+                    UNIQUE(bill_id, chapter)
+                )
+            """)
+            
+            chapter_list = extract_chapters(summary_text)
+            for ch in chapter_list:
+                try:
+                    c.execute("""
+                        INSERT OR IGNORE INTO bill_chapters
+                            (bill_id, bill_number, chapter)
+                        VALUES (?, ?, ?)
+                """, (bill_id, bill_number, ch))
                 except Exception:
                     pass
 
