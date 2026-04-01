@@ -11,11 +11,10 @@ from pdf_reports import (
 
 st.set_page_config(
     page_title="Missouri Vote Tracker",
-    page_icon="🏛️",
     layout="wide"
 )
 
-st.title("🏛️ Missouri Vote Tracker")
+st.title(" Missouri Vote Tracker")
 st.caption("Tracking votes in the Missouri House and Senate")
 
 # ----------------------- DATA LOADING -----------------------
@@ -309,15 +308,19 @@ def search_bills(bill_number_query, title_query, chamber_filter,
 def get_last_updated():
     try:
         conn = get_current_db()
-        df = pd.read_sql_query("""
-            SELECT MAX(fetched_at) as last_updated
-            FROM bill_summaries
-        """, conn)
-        if not df.empty and df.iloc[0]["last_updated"]:
-            from datetime import datetime
-            ts = df.iloc[0]["last_updated"]
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM meta WHERE key = 'votes_last_updated'")
+        row = cursor.fetchone()
+        if row:
+            from datetime import datetime, timezone
+            import zoneinfo
+            ts = row[0].replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts)
-            return dt.strftime("%B %d, %Y at %I:%M %p")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            central = zoneinfo.ZoneInfo("America/Chicago")
+            dt_central = dt.astimezone(central)
+            return dt_central.strftime("%B %d, %Y at %I:%M %p CT")
         return "Unknown"
     except Exception:
         return "Unknown"
