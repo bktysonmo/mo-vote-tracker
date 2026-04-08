@@ -925,7 +925,7 @@ def render_bill_detail(bill_id, bill_number, bill_title, bill_row, depth=0):
  
     for rc in rc_list:
         result_label = "✅ Passed" if rc["passed"] == 1 else "❌ Failed"
-        source_badge = "📡 LegiScan" if rc["source"] == "LegiScan" else "📄 House Journal"
+        source_badge = "LegiScan" if rc["source"] == "LegiScan" else "House Journal"
         with st.expander(f"{rc['date']} — {rc['description']} ({result_label})  {source_badge}"):
             c1, c2, c3 = st.columns(3)
             c1.metric("Yea", rc["yea"])
