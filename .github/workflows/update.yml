@@ -2,11 +2,11 @@ name: Nightly Vote Update
 
 on:
   schedule:
-    - cron: '0 23 * * 1'
-    - cron: '0 23 * * 5'
-    - cron: '0 14 * * 2,3,4'
-    - cron: '0 19 * * 2,3,4'
-    - cron: '0 23 * * 2,3,4'
+    - # cron: '0 23 * * 1'
+    - # cron: '0 23 * * 5'
+    - # cron: '0 14 * * 2,3,4'
+    - # cron: '0 19 * * 2,3,4'
+    - # cron: '0 23 * * 2,3,4'
   workflow_dispatch:
 
 permissions:
